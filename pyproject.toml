@@ -1,0 +1,58 @@
+[tool.poetry]
+name = "aw-watcher-pipeline-stage"
+version = "0.1.0"
+description = "ActivityWatch watcher for development pipeline stages"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "aw_watcher_pipeline_stage"}]
+license = "MIT"
+repository = "https://github.com/yourusername/aw-watcher-pipeline-stage"
+keywords = ["activitywatch", "watcher", "productivity", "pipeline", "development"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Utilities",
+    "Environment :: Console",
+]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+aw-client = "^0.5.12"
+watchdog = "^4.0.0"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.0.0"
+isort = "^5.13.0"
+mypy = "^1.8.0"
+pytest = "^8.0.0"
+pytest-cov = "^4.1.0"
+pytest-mock = "^3.12.0"
+types-setuptools = "^69.0.0"
+psutil = "^6.0.0"
+
+[tool.poetry.scripts]
+aw-watcher-pipeline-stage = "aw_watcher_pipeline_stage.main:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = "."
+addopts = "--cov=aw_watcher_pipeline_stage --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["aw_watcher_pipeline_stage"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+files = ["aw_watcher_pipeline_stage", "tests"]
