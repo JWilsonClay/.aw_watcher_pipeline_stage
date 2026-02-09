@@ -1,0 +1,16 @@
+How to Prompt to Avoid Corruption
+To bypass these limitations, you can change your prompting strategy to rely on the model's strengths (text matching) rather than its weaknesses (counting).
+
+Option 1: Request "Search and Replace" Blocks (Recommended) Instead of asking for a diff, ask the model to provide unique text blocks.
+
+Prompt: "Don't use a diff. Provide the code change as a Search and Replace block. Show me the exact block of text to find, and the exact block of text to replace it with."
+
+Option 2: The "Two-Step" Diff Break the math problem in half.
+
+Prompt: "First, give me a diff to DELETE the old section. Then, in a separate block, give me a diff to INSERT the new section. Do not combine them."
+
+Option 3: Request the Full File If the file is under ~2000 lines (which yours is), this is the most reliable method.
+
+Prompt: "Output the full content of the updated file. Do not use diffs."
+
+unified diff is the hardest for LLM's to process.

@@ -728,3 +728,129 @@ def test_main_loop_observer_access_failure(
 
     # Should have slept in the exception block
     assert mock_sleep.call_count >= 2
+
+
+def test_main_load_config_exit_propagation() -> None:
+    """Test that SystemExit from load_config propagates out of main."""
+    with patch("aw_watcher_pipeline_stage.main.load_config", side_effect=SystemExit(1)):
+        with patch.object(sys, "argv", ["prog"]):
+            with pytest.raises(SystemExit):
+                from aw_watcher_pipeline_stage.main import main
+                main()
+
+
+def test_main_malicious_arg_exit() -> None:
+    """Test that main exits when a malicious path argument causes config failure."""
+    with patch("aw_watcher_pipeline_stage.main.load_config", side_effect=SystemExit(1)):
+        with patch.object(sys, "argv", ["prog", "--watch-path", "/dev/mem"]):
+            with pytest.raises(SystemExit):
+                from aw_watcher_pipeline_stage.main import main
+                main()
+
+
+def test_main_log_file_directory_failure(tmp_path: Path) -> None:
+    """Test that specifying a directory as log file causes exit."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    
+    with patch.object(sys, "argv", ["prog", "--log-file", str(log_dir)]):
+        with pytest.raises(SystemExit):
+            from aw_watcher_pipeline_stage.main import main
+            main()
+
+@patch("aw_watcher_pipeline_stage.main.load_config")
+@patch("sys.exit")
+def test_main_log_file_traversal_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
+    """Test that main exits if log file path traversal fails validation."""
+    # Simulate load_config raising SystemExit due to validation failure
+    mock_load_config.side_effect = SystemExit(1)
+    
+    with patch.object(sys, "argv", ["prog", "--log-file", "../../../etc/passwd"]):
+        try:
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        except SystemExit:
+            pass
+            
+    mock_load_config.assert_called()
+
+@patch("aw_watcher_pipeline_stage.main.load_config")
+@patch("sys.exit")
+def test_main_watch_path_traversal_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
+    """Test that main exits if watch path traversal fails validation."""
+    # Simulate load_config raising SystemExit due to validation failure
+    mock_load_config.side_effect = SystemExit(1)
+    
+    with patch.object(sys, "argv", ["prog", "--watch-path", "../../../etc/passwd"]):
+        try:
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        except SystemExit:
+            pass
+            
+    mock_load_config.assert_called()
+
+
+@patch("aw_watcher_pipeline_stage.main.load_config")
+@patch("sys.exit")
+def test_main_watch_path_symlink_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
+    """Test that main exits if watch path is a symlink (simulated validation failure)."""
+    mock_load_config.side_effect = SystemExit(1)
+    
+    with patch.object(sys, "argv", ["prog", "--watch-path", "symlink.json"]):
+        try:
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        except SystemExit:
+            pass
+            
+    mock_load_config.assert_called()
+
+
+@patch("aw_watcher_pipeline_stage.main.load_config")
+@patch("sys.exit")
+def test_main_log_file_parent_failure(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
+    """Test that main exits if log file parent directory does not exist."""
+    # Simulate load_config raising SystemExit due to validation failure
+    mock_load_config.side_effect = SystemExit(1)
+    
+    with patch.object(sys, "argv", ["prog", "--log-file", "/nonexistent/dir/log.txt"]):
+        try:
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        except SystemExit:
+            pass
+            
+    mock_load_config.assert_called()
+
+@patch("aw_watcher_pipeline_stage.main.load_config")
+@patch("sys.exit")
+def test_main_watch_path_permission_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
+    """Test that main exits if watch path permission is denied."""
+    # Simulate load_config raising SystemExit due to permission failure
+    mock_load_config.side_effect = SystemExit(1)
+    
+    with patch.object(sys, "argv", ["prog", "--watch-path", "/nopermission.json"]):
+        try:
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        except SystemExit:
+            pass
+            
+    mock_load_config.assert_called()
+
+
+@patch("aw_watcher_pipeline_stage.main.load_config")
+@patch("sys.exit")
+def test_main_log_file_symlink_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
+    """Test that main exits if log file is a symlink (simulated validation failure)."""
+    mock_load_config.side_effect = SystemExit(1)
+    
+    with patch.object(sys, "argv", ["prog", "--log-file", "symlink.log"]):
+        try:
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        except SystemExit:
+            pass
+            
+    mock_load_config.assert_called()

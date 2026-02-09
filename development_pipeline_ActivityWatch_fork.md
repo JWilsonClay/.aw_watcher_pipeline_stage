@@ -8,7 +8,7 @@ Key Libraries/Frameworks: aw-client, watchdog, argparse, logging, json
 Database / Storage: Local JSON file, ActivityWatch buckets
 Frontend / GUI (if any): CLI / ActivityWatch WebUI
 Current Architecture Summary: Modular Python package with `main` (CLI/Signals), `watcher` (Watchdog Observer + Debounce), `client` (AW Wrapper + Retries), and `config` (Priority Loading).
-Last Major Change: Stage 2 functional correctness verified; core logic operational.
+Last Major Change: Stage 4 Security Audit complete; mitigations applied.
 
 ## Refined Role Starters (see role_starters.md for the three clean role prompts)
 
@@ -275,27 +275,45 @@ Key Libraries/Frameworks: aw-client, watchdog, argparse, logging, json
 Database / Storage: Local JSON file, ActivityWatch buckets
 Frontend / GUI (if any): CLI / ActivityWatch WebUI
 Current Architecture Summary: Modular Python package with `main` (CLI/Signals), `watcher` (Watchdog Observer + Debounce), `client` (AW Wrapper + Retries), and `config` (Priority Loading).
-Last Major Change: Stage 2 functional correctness verified; core logic operational.
+Last Major Change: Stage 3 debugging and robustness hardening complete; ready for Stage 4.
 
-Specific Issue:
-Error Message: 
-File/Line: 
-Reproduction Steps: 
-Expected Behavior: 
-Actual Behavior: 
+### Stage 3 Completion Report
 
-Code Snippet:
+**Summary of Work:**
+Comprehensive debugging and robustness hardening completed. Addressed race conditions in file watching, improved error handling for transient I/O issues, and verified non-functional requirements via extensive testing.
 
-What I've Already Tried:
+**Test Coverage:**
+- **Unit & Integration**: High coverage (>90% estimated) across `config`, `watcher`, `client`, and `main` modules.
+- **Scenarios Covered**:
+  - Configuration priority (CLI > Env > File).
+  - File creation, modification, deletion, and moves.
+  - JSON parsing (malformed, partial, BOM, Unicode).
+  - Debounce logic (rapid updates, irrelevant changes).
+  - Network resilience (offline queuing, retry backoff).
+  - Resource usage (CPU/Memory monitoring).
+  - Signal handling (SIGINT/SIGTERM graceful shutdown).
 
-Architect Version → copy to Architect LLM:
-[PASTE ARCHITECT ROLE STARTER + fill Stage 3 details]
+**Fixes Applied:**
+- **Watcher**: Added explicit handling for `stat()` OSErrors to prevent crashes during race conditions (e.g., atomic writes).
+- **Watcher**: Fixed retry logic in `_read_file_data` to ensure proper loop continuation.
+- **Client**: Added warnings for negative or excessive `computed_duration` to detect system clock skew/jumps.
+- **Main**: Enhanced signal handler resilience and resource usage logging to handle edge cases (e.g., rapid shutdown).
+- **Config**: Hardened path resolution and cross-platform config loading.
 
-Senior Project Manager Version → copy to SeniorPM LLM:
-[PASTE PM ROLE STARTER + fill Stage 3 details]
+**Non-functional Compliance:**
+- **Low CPU/Memory**: Verified via `log_resource_usage`. Event-driven design with debounce prevents polling loops.
+- **Offline Support**: `queued=True` enabled for all heartbeats; local buffering verified in integration tests.
+- **Robustness**: Retry mechanisms with exponential backoff implemented for I/O and network operations.
 
-Senior Systems Engineer Version → copy to SeniorSE LLM:
-[PASTE ENGINEER ROLE STARTER + fill Stage 3 details]
+**Readiness for Stage 4:**
+- Codebase is stable and functionally complete.
+- Error handling is robust enough for security audit (Stage 4).
+- Documentation (docstrings) is present.
+- Ready for packaging and potential PR to ActivityWatch.
+
+**Open Items / Risks:**
+- **Risk**: `watchdog` on some specific filesystems (e.g., network shares) might behave inconsistently; current tests focus on local filesystems.
+- **Item**: Final verification of `pyproject.toml` dependencies for security vulnerabilities (to be covered in Stage 4).
 
 Checklist:
 - Updated Global Project Context?
@@ -313,13 +331,29 @@ Template:
 ### STAGE 4: Security Audit
 
 Global Project Context:
-[PASTE ABOVE]
+Project Name: aw-watcher-pipeline-stage
+Overall Goal: Develop a lightweight Python watcher for ActivityWatch that monitors a local `current_task.json` file and automatically logs development pipeline stage/task activity.
+Languages Used: Python 3.8+
+Key Libraries/Frameworks: aw-client, watchdog, argparse, logging, json
+Database / Storage: Local JSON file, ActivityWatch buckets
+Frontend / GUI (if any): CLI / ActivityWatch WebUI
+Current Architecture Summary: Modular Python package with `main` (CLI/Signals), `watcher` (Watchdog Observer + Debounce), `client` (AW Wrapper + Retries), and `config` (Priority Loading).
+Last Major Change: Stage 4 Security Audit complete; mitigations applied.
 
 Specific Security Focus Areas (e.g., input validation, auth, data storage):
+- **Input Validation**: Robustness against malformed `current_task.json` (BOM, encoding, partial data), handling of large files (DoS prevention), and unexpected data types.
+- **Path Traversal / Symlinks**: Ensure `watch_path` and `log_file` handling doesn't allow arbitrary file access or overwrites.
+- **Dependency Safety**: Check `watchdog` and `aw-client` for known vulnerabilities.
+- **Resource Exhaustion**: Verify debounce logic prevents CPU spikes during rapid file system events (DoS).
 
 Code / Modules Handling Sensitive Data:
+- `watcher.py`: Reads content from `current_task.json`.
+- `client.py`: Transmits data to the local ActivityWatch server.
 
 Threat Model Notes:
+- **Trust Boundary**: The tool runs locally with user privileges. `current_task.json` is assumed to be writable by the user.
+- **Attack Vector**: A malicious process or user modifying `current_task.json` to trigger resource exhaustion or crash the watcher.
+- **Privacy**: Ensure no unintended data (like env vars or unrelated file contents) is leaked into the heartbeat payload.
 
 Architect Version → copy to Architect LLM:
 [PASTE ARCHITECT ROLE STARTER + fill Stage 4 details]
@@ -331,10 +365,10 @@ Senior Systems Engineer Version → copy to SeniorSE LLM:
 [PASTE ENGINEER ROLE STARTER + fill Stage 4 details]
 
 Checklist:
-- Updated Global Project Context?
-- Saved security fixes?
-- Updated Last Major Change?
-- Reviewed dependencies/vulnerabilities?
+[x] Updated Global Project Context?
+[x] Saved security fixes?
+[x] Updated Last Major Change?
+[x] Reviewed dependencies/vulnerabilities?
 
 ## Stage 5: Testing Strategy
 
@@ -349,9 +383,22 @@ Global Project Context:
 [PASTE ABOVE]
 
 Key Functions/Modules to Test:
+- `watcher.py`: `_read_file_data` (size limits, BOM, permissions), `_process_event` (debounce, symlink checks), `_process_state_change` (metadata filtering).
+- `client.py`: `send_heartbeat` (offline queuing, payload sanitization), `ensure_bucket`.
+- `config.py`: Path validation (symlinks, directories).
+- `main.py`: Signal handling, startup race conditions.
+
 Test Types Needed (unit, integration, property-based, etc.):
+- **Unit**: Edge cases (malformed JSON, permission denied, large files).
+- **Integration**: End-to-end flow with mock client, file system events.
+- **Security**: Symlink attacks, path traversal, DoS (rapid events).
+- **Robustness**: Recovery from deleted files, server offline.
 
 Existing Tests (if any):
+- `tests/test_config.py`: Path validation, symlink checks.
+- `tests/test_main.py`: Signal handling, startup resilience.
+- `tests/test_watcher.py`: Debounce, JSON parsing, symlink runtime checks.
+- `tests/test_client.py`: Offline buffering, hostname sanitization.
 
 Architect Version → copy to Architect LLM:
 [PASTE ARCHITECT ROLE STARTER + fill Stage 5 details]

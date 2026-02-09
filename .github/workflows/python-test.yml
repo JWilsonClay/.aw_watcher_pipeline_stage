@@ -1,0 +1,46 @@
+name: Python CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: "poetry"
+
+    - name: Install Poetry
+      run: |
+        pipx install poetry
+
+    - name: Install dependencies
+      run: |
+        poetry install --with dev --no-interaction
+
+    - name: Run pre-commit hooks (Black, Isort, Mypy)
+      run: |
+        poetry run pre-commit run --all-files
+
+    - name: Run security audit (pip-audit)
+      run: |
+        poetry run pip install pip-audit
+        poetry run pip-audit --desc
+
+    - name: Run tests with coverage
+      run: |
+        poetry run pytest --cov=aw_watcher_pipeline_stage --cov-report=term-missing --cov-fail-under=90

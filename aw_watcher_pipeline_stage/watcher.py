@@ -21,7 +21,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_SIZE_BYTES = 10 * 1024  # 10 KB (Security: DoS prevention)
+VALID_STATUSES = {"in_progress", "paused", "completed"}
 
 
 class PipelineEventHandler(FileSystemEventHandler):
@@ -49,7 +50,12 @@ class PipelineEventHandler(FileSystemEventHandler):
             debounce_seconds: Time in seconds to debounce file events.
             logger: Optional logger instance.
         """
-        self.watch_path = watch_path.absolute()
+        try:
+            # Security: Use absolute() instead of resolve() to avoid following symlinks
+            self.watch_path = watch_path.absolute()
+        except (OSError, RuntimeError):
+            self.watch_path = watch_path.absolute()
+
         self.client = client
         self.pulsetime = pulsetime
         self.debounce_seconds = debounce_seconds
@@ -77,7 +83,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                 else:
                     self.target_file = self.watch_path / "current_task.json"
         except (OSError, RuntimeError) as e:
-            self.logger.debug(f"Filesystem check failed during init, using heuristic fallback: {e}")
+            self.logger.debug(
+                f"Filesystem check failed during init, using heuristic fallback: {e}"
+            )
             # Fallback if filesystem check fails
             if self.watch_path.suffix:
                 self.target_file = self.watch_path
@@ -118,6 +126,15 @@ class PipelineEventHandler(FileSystemEventHandler):
 
         self._heartbeat_timer: Optional[threading.Timer] = None
 
+        # Security: Rate limiting (Token Bucket) for DoS prevention.
+        # Effectively acts as a queue with max size 100 (burst) and refill rate 10/s.
+        self._rate_limit_max: float = 100.0
+        self._rate_limit_tokens: float = 100.0
+        self._rate_limit_fill_rate: float = 10.0  # tokens per second
+        self._rate_limit_last_update: float = time.monotonic()
+        self._dropped_events: int = 0
+        self._last_dropped_log_time: float = 0.0
+
     def _process_event(self, event: FileSystemEvent) -> None:
         """Process a file system event with debounce logic.
 
@@ -127,6 +144,7 @@ class PipelineEventHandler(FileSystemEventHandler):
         if self._stopped:
             return
 
+        # Security: Ignore directory events in file processing logic
         if event.is_directory:
             return
 
@@ -135,18 +153,41 @@ class PipelineEventHandler(FileSystemEventHandler):
         if isinstance(event, FileMovedEvent):
             file_path = event.dest_path
 
-        self.logger.debug(f"Processing event: {event.event_type} on {file_path}")
-        # Check if the event matches our target file
+        # 1. Path Validation (Security: Ensure we only process the resolved target file)
+        # Move this BEFORE rate limiting to avoid DoS from other files in the directory
         try:
             event_path = Path(file_path).absolute()
-            if event_path != self.target_file:
-                # Fallback: check if resolved path matches (handles symlink targets)
-                if event_path.resolve() != self.target_file.resolve():
-                    return
+            # Security: Ensure we only process the resolved target file (no symlink following).
+            if event_path != self.target_file.absolute():
+                # Strict path checking: Do not follow symlinks or resolve paths
+                return
         except (OSError, RuntimeError) as e:
             # File might have been deleted or inaccessible
             self.logger.debug(f"Could not resolve path in _process_event: {e}")
             return
+
+        self.logger.debug(f"Processing event: {event.event_type} on {file_path}")
+
+        # 2. Rate Limiting: Token Bucket Algorithm
+        now = time.monotonic()
+        time_passed = now - self._rate_limit_last_update
+        self._rate_limit_last_update = now
+        self._rate_limit_tokens = min(
+            self._rate_limit_max,
+            self._rate_limit_tokens + time_passed * self._rate_limit_fill_rate,
+        )
+
+        if self._rate_limit_tokens < 1.0:
+            self._dropped_events += 1
+            if now - self._last_dropped_log_time > 5.0:
+                self.logger.warning(
+                    f"Rate limit exceeded (DoS prevention). Dropping excess events for {file_path}. "
+                    f"Total dropped: {self._dropped_events}"
+                )
+                self._last_dropped_log_time = now
+            return
+
+        self._rate_limit_tokens -= 1.0
 
         self.events_detected += 1
         self.last_event_time = time.monotonic()
@@ -227,6 +268,7 @@ class PipelineEventHandler(FileSystemEventHandler):
         """Read and parse the JSON file. Performs I/O.
 
         Handles missing files, permissions, and malformed JSON with retries and logging.
+        Security: Enforces size limit (10KB) and handles BOM to prevent DoS/injection.
 
         Args:
             file_path: The path to the file to parse.
@@ -243,6 +285,7 @@ class PipelineEventHandler(FileSystemEventHandler):
         try:
             path = Path(file_path)
             data = None
+            content = ""
 
             # Retry settings for transient IO errors
             backoff = 0.1
@@ -251,6 +294,13 @@ class PipelineEventHandler(FileSystemEventHandler):
                 if self._stopped:
                     return
                 try:
+                    # Security: Check for symlinks to prevent arbitrary file read
+                    # Note: There is a theoretical TOCTOU window here, but we accept the risk for cross-platform compatibility
+                    # and because we run with user privileges.
+                    if path.is_symlink():
+                        self.logger.warning(f"Target is a symlink, skipping read (security): {file_path}")
+                        return None
+
                     file_stat = path.stat()
                     
                     # Ensure it's a regular file to avoid blocking on pipes/devices
@@ -285,8 +335,8 @@ class PipelineEventHandler(FileSystemEventHandler):
                             self.logger.debug(f"File {file_path} is empty after retries, skipping parse.")
                             return None
 
-                    # Safety check for very large files (stability)
-                    if file_stat.st_size > MAX_FILE_SIZE_BYTES:
+                    # Security: Check size to avoid OOM / DoS
+                    if file_stat.st_size > MAX_FILE_SIZE_BYTES or file_stat.st_size < 0:
                         now = time.monotonic()
                         if now - self._last_file_size_warning_time > 60.0:
                             self.logger.warning(
@@ -296,13 +346,27 @@ class PipelineEventHandler(FileSystemEventHandler):
                         return None
 
                     with path.open("r", encoding="utf-8-sig") as f:
-                        # Read with limit to prevent OOM if file grows after stat
+                        # Security: Read with limit to prevent OOM if file grows after stat
                         content = f.read(MAX_FILE_SIZE_BYTES + 1)
                         if len(content) > MAX_FILE_SIZE_BYTES:
-                            self.logger.warning(
-                                f"File {file_path} content exceeds limit ({MAX_FILE_SIZE_BYTES} bytes), skipping parse."
-                            )
+                            now = time.monotonic()
+                            if now - self._last_file_size_warning_time > 60.0:
+                                self.logger.warning(
+                                    f"File {file_path} content exceeds limit ({MAX_FILE_SIZE_BYTES} chars), skipping parse."
+                                )
+                                self._last_file_size_warning_time = now
                             return None
+
+                        if not content.strip():
+                            if attempt < max_attempts - 1:
+                                self.logger.debug(f"File {file_path} is empty or whitespace only, retrying in {backoff}s...")
+                                time.sleep(backoff)
+                                if self._stopped:
+                                    return None
+                                backoff *= 2
+                                continue
+                            return None
+
                         data = json.loads(content)
                     break
                 except IsADirectoryError:
@@ -330,7 +394,7 @@ class PipelineEventHandler(FileSystemEventHandler):
                     else:
                         now = time.monotonic()
                         if now - self.last_read_error_time > 60.0:
-                            self.logger.error(f"Encoding error in {file_path} after {max_attempts} attempts: {e}")
+                            self.logger.warning(f"Encoding error in {file_path} after {max_attempts} attempts: {e}")
                             self.last_read_error_time = now
                         with self._lock:
                             self.parse_errors += 1
@@ -354,10 +418,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                         self.last_error_time = now
                     return None
                 except json.JSONDecodeError as e:
-                    snippet = content[:50].replace("\n", "\\n")
                     if attempt < max_attempts - 1:
                         self.logger.debug(
-                            f"Malformed JSON in {file_path}: {e}. Snippet: '{snippet}'. Retrying in {backoff}s..."
+                            f"Malformed JSON in {file_path}. Retrying in {backoff}s..."
                         )
                         time.sleep(backoff)
                         if self._stopped:
@@ -367,15 +430,50 @@ class PipelineEventHandler(FileSystemEventHandler):
                     else:
                         now = time.monotonic()
                         if now - self.last_read_error_time > 60.0:
-                            self.logger.error(
-                                f"Malformed JSON in {file_path} after {max_attempts} attempts: {e}. Snippet: '{snippet}'"
+                            self.logger.warning(
+                                f"Malformed JSON in {file_path} after {max_attempts} attempts."
                             )
+                            self.last_read_error_time = now
+                        
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self.logger.debug(f"JSON Decode Error: {e}")
+                            snippet = content[:50].replace("\n", "\\n")
+                            self.logger.debug(f"JSON Snippet: '{snippet}'")
+
+                        with self._lock:
+                            self.parse_errors += 1
+                            self.last_error_time = now
+                        return None
+                except RecursionError as e:
+                    now = time.monotonic()
+                    if now - self.last_read_error_time > 60.0:
+                        self.logger.error(
+                            f"JSON recursion limit exceeded in {file_path}: {e} (Possible DoS attempt)"
+                        )
+                        self.last_read_error_time = now
+                    with self._lock:
+                        self.parse_errors += 1
+                        self.last_error_time = now
+                    return None
+                except ValueError as e:
+                    # Catch other ValueErrors (unlikely with json.loads but good for safety)
+                    if attempt < max_attempts - 1:
+                        self.logger.debug(f"Value error for {file_path}: {e}. Retrying in {backoff}s...")
+                        time.sleep(backoff)
+                        if self._stopped:
+                            return None
+                        backoff *= 2
+                        continue
+                    else:
+                        now = time.monotonic()
+                        if now - self.last_read_error_time > 60.0:
+                            self.logger.error(f"Value error processing {file_path}: {e}")
                             self.last_read_error_time = now
                         with self._lock:
                             self.parse_errors += 1
                             self.last_error_time = now
                         return None
-                except (OSError, ValueError, RecursionError) as e:
+                except OSError as e:
                     if attempt < max_attempts - 1:
                         self.logger.debug(f"Read error for {file_path}: {e}. Retrying in {backoff}s...")
                         time.sleep(backoff)
@@ -403,7 +501,7 @@ class PipelineEventHandler(FileSystemEventHandler):
                     return None
 
             if not isinstance(data, dict):
-                self.logger.error(f"JSON root is not a dictionary in {file_path}")
+                self.logger.warning(f"JSON root is not a dictionary in {file_path}")
                 with self._lock:
                     self.parse_errors += 1
                     self.last_error_time = time.monotonic()
@@ -430,15 +528,49 @@ class PipelineEventHandler(FileSystemEventHandler):
             current_task = data.get("current_task")
 
             if not current_stage or not current_task:
-                self.logger.error(f"Missing required fields (current_stage, current_task) in {file_path}")
+                self.logger.warning(f"Missing required fields (current_stage, current_task) in {file_path}")
                 self.parse_errors += 1
                 self.last_error_time = time.monotonic()
                 return None
 
+            if not isinstance(current_stage, str):
+                self.logger.warning(f"current_stage must be a string in {file_path}")
+                self.parse_errors += 1
+                self.last_error_time = time.monotonic()
+                return None
+            current_stage = current_stage.strip()
+
+            if not isinstance(current_task, str):
+                self.logger.warning(f"current_task must be a string in {file_path}")
+                self.parse_errors += 1
+                self.last_error_time = time.monotonic()
+                return None
+            current_task = current_task.strip()
+
             # Extract optional fields
             project_id = data.get("project_id")
+            if project_id is not None and not isinstance(project_id, str):
+                self.logger.warning(f"project_id must be a string in {file_path}. Ignoring.")
+                project_id = None
+            elif project_id is not None:
+                project_id = project_id.strip()
+
             start_time = data.get("start_time")
             status = data.get("status")
+            if status is not None:
+                if not isinstance(status, str):
+                    self.logger.warning(f"status must be a string in {file_path}. Defaulting to 'in_progress'.")
+                    status = "in_progress"
+                else:
+                    status = status.strip().lower()
+                    if status not in VALID_STATUSES:
+                        self.logger.warning(
+                            f"Invalid status value in {file_path}. Expected: {', '.join(sorted(VALID_STATUSES))}."
+                        )
+                        status = "in_progress"
+            else:
+                status = "in_progress"
+
             metadata = data.get("metadata", {})
 
             # Validate metadata is a dict to ensure flattening works later
@@ -448,16 +580,27 @@ class PipelineEventHandler(FileSystemEventHandler):
                 )
                 metadata = {}
 
+            # Security: Filter metadata early if allowlist is configured
+            # This prevents blocked data from being stored in memory or triggering updates
+            if getattr(self.client, "metadata_allowlist", None) is not None:
+                allowlist = self.client.metadata_allowlist
+                metadata = {k: v for k, v in metadata.items() if k in allowlist}
+
             # Validate timestamp if present
             if start_time:
-                try:
-                    # Basic ISO 8601 check
-                    datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
-                except ValueError:
-                    self.logger.warning(
-                        f"Invalid timestamp format in start_time: {start_time}. Ignoring."
-                    )
+                if not isinstance(start_time, str):
+                    self.logger.warning(f"start_time must be a string in {file_path}. Ignoring.")
                     start_time = None
+                else:
+                    start_time = start_time.strip()
+                    try:
+                        # Basic ISO 8601 check
+                        datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                    except ValueError:
+                        self.logger.warning(
+                            f"Invalid timestamp format in start_time in {file_path}. Ignoring."
+                        )
+                        start_time = None
 
             # Construct comparison data (optimization: direct dict compare instead of hash)
             # This avoids serialization overhead and handles key order naturally.
@@ -493,7 +636,7 @@ class PipelineEventHandler(FileSystemEventHandler):
                 "status": status,
                 "start_time": start_time,
                 "metadata": metadata,
-                "file_path": str(Path(file_path).absolute()),
+                "file_path": str(Path(file_path).absolute()),  # Ensure absolute path
             }
             self.logger.debug(f"Current data updated. Keys: {len(self.current_data)}")
 
@@ -572,7 +715,7 @@ class PipelineEventHandler(FileSystemEventHandler):
                 stage=str(data.get("current_stage", "")),
                 task=str(data.get("current_task", "")),
                 project_id=data.get("project_id"),
-                status=str(data.get("status", "in_progress")),
+                status=str(data.get("status")),
                 start_time=data.get("start_time"),
                 metadata=data.get("metadata"),
                 file_path=data.get("file_path"),
@@ -616,20 +759,20 @@ class PipelineEventHandler(FileSystemEventHandler):
                 needs_healing = True
 
         if needs_healing and (now - self.last_parse_attempt > 30.0):
-             try:
-                 if self.target_file.exists():
-                     # Use max_attempts=1 to avoid blocking the main loop on retries
-                     healing_data = self._read_file_data(
-                         str(self.target_file), max_attempts=1
-                     )
-                 else:
-                     # File doesn't exist, update timestamp to avoid polling every second
-                     with self._lock:
-                         self.last_parse_attempt = now
-             except OSError as e:
-                 self.logger.warning(f"Failed to check file existence during self-healing: {e}")
-                 with self._lock:
-                     self.last_parse_attempt = now
+            try:
+                if self.target_file.exists():
+                    # Use max_attempts=1 to avoid blocking the main loop on retries
+                    healing_data = self._read_file_data(
+                        str(self.target_file), max_attempts=1
+                    )
+                else:
+                    # File doesn't exist, update timestamp to avoid polling every second
+                    with self._lock:
+                        self.last_parse_attempt = now
+            except OSError as e:
+                self.logger.warning(f"Failed to check file existence during self-healing: {e}")
+                with self._lock:
+                    self.last_parse_attempt = now
 
         with self._lock:
             if not self.current_data and healing_data:
@@ -712,7 +855,7 @@ class PipelineEventHandler(FileSystemEventHandler):
         if event.is_directory:
             # Check if watched directory was moved away
             try:
-                src_path = Path(event.src_path).resolve()
+                src_path = Path(event.src_path).absolute()
                 if src_path == self.target_file.parent:
                     self.logger.warning(
                         f"Watch directory moved: {event.src_path} -> {event.dest_path}"
@@ -724,7 +867,7 @@ class PipelineEventHandler(FileSystemEventHandler):
                             self.last_comparison_data = None
                             self.on_state_changed(self.current_data, 0.0)
                 elif self.current_data:
-                            self.current_data = {}
+                    self.current_data = {}
             except OSError as e:
                 self.logger.debug(f"Failed to resolve path in on_moved (directory): {e}")
                 pass
@@ -732,20 +875,20 @@ class PipelineEventHandler(FileSystemEventHandler):
 
         # Check if moved AWAY from target (effectively deleted/renamed)
         try:
-            src_path = Path(event.src_path).resolve()
-        except (OSError, RuntimeError):
             src_path = Path(event.src_path).absolute()
-
-        if src_path == self.target_file:
-            self.logger.info(f"File moved away: {event.src_path} -> {event.dest_path}")
-            with self._lock:
-                self.is_paused = True
-                if self.current_data and self.current_data.get("current_stage"):
-                    self.current_data["status"] = "paused"
-                    self.last_comparison_data = None
-                    self.on_state_changed(self.current_data, 0.0)
-                elif self.current_data:
-                    self.current_data = {}
+            if src_path == self.target_file:
+                self.logger.info(f"File moved away: {event.src_path} -> {event.dest_path}")
+                with self._lock:
+                    self.is_paused = True
+                    if self.current_data and self.current_data.get("current_stage"):
+                        self.current_data["status"] = "paused"
+                        self.last_comparison_data = None
+                        self.on_state_changed(self.current_data, 0.0)
+                    elif self.current_data:
+                        self.current_data = {}
+        except OSError as e:
+            self.logger.debug(f"Failed to resolve path in on_moved (file): {e}")
+            pass
 
         # Check if moved TO target (handled by _process_event)
         self._process_event(event)
@@ -759,7 +902,7 @@ class PipelineEventHandler(FileSystemEventHandler):
         if event.is_directory:
             # Check if watched directory was deleted
             try:
-                src_path = Path(event.src_path).resolve()
+                src_path = Path(event.src_path).absolute()
                 if src_path == self.target_file.parent:
                     self.logger.warning(f"Watch directory deleted: {event.src_path}")
                     with self._lock:
@@ -776,11 +919,10 @@ class PipelineEventHandler(FileSystemEventHandler):
             return
 
         try:
-            event_path = Path(event.src_path).resolve()
-        except (OSError, RuntimeError):
             event_path = Path(event.src_path).absolute()
-
-        if event_path != self.target_file:
+            if event_path != self.target_file:
+                return
+        except OSError:
             return
 
         self.logger.warning(f"File deleted: {event.src_path}")
@@ -817,7 +959,12 @@ class PipelineWatcher:
             pulsetime: The pulsetime for heartbeats.
             debounce_seconds: Time in seconds to debounce file events.
         """
-        self.path = Path(path).absolute()
+        try:
+            # Security: Use absolute() instead of resolve() to avoid following symlinks
+            self.path = Path(path).absolute()
+        except (OSError, RuntimeError):
+            self.path = Path(path).absolute()
+
         self.client = client
         self._observer: Optional[Observer] = None
         self._stopping = False
@@ -898,6 +1045,9 @@ class PipelineWatcher:
                     return
 
                 # Schedule and start if not alive
+                # Security: recursive=False to prevent watching subdirectories.
+                # Security: We watch the resolved directory to handle atomic writes (rename),
+                # but filter events in handler to ensure we only process the target file.
                 self._observer.schedule(self.handler, str(self.watch_dir), recursive=False)
                 self._observer.start()
                 logger.info(f"Observer started ({type(self._observer).__name__})")

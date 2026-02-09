@@ -10,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -814,7 +815,7 @@ def test_parse_file_wrapper_execution(pipeline_client: PipelineClient, temp_dir:
 
     with patch.object(handler, "_read_file_data", return_value={"stage": "test"}) as mock_read:
         with patch.object(handler, "on_state_changed") as mock_on_change:
-        # Simulate that this call is coming from the active timer
+            # Simulate that this call is coming from the active timer
             handler._timer = threading.current_thread()  # type: ignore
 
             handler._parse_file_wrapper(str(f))
@@ -1425,11 +1426,11 @@ def test_parse_encoding_error(pipeline_client: PipelineClient, temp_dir: Path) -
     with patch("time.sleep"):
         handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
 
-        with patch.object(handler.logger, "error") as mock_error:
+        with patch.object(handler.logger, "warning") as mock_warn:
             handler._read_file_data(str(f))
-            mock_error.assert_called_once()
+            mock_warn.assert_called_once()
             # The error message might vary slightly depending on where it was caught, but should be logged
-            assert "Encoding error" in mock_error.call_args[0][0]
+            assert "Encoding error" in mock_warn.call_args[0][0]
 
 
 def test_on_deleted_oserror(pipeline_client: PipelineClient, temp_dir: Path) -> None:
@@ -1441,7 +1442,7 @@ def test_on_deleted_oserror(pipeline_client: PipelineClient, temp_dir: Path) -> 
     event.src_path = str(f)
 
     # Simulate OSError when resolving path
-    with patch.object(Path, "resolve", side_effect=OSError("Path error")):
+    with patch.object(Path, "absolute", side_effect=OSError("Path error")):
         # Should simply return without error/warning/crash
         handler.on_deleted(event)
 
@@ -3932,3 +3933,1627 @@ def test_small_debounce_warning(pipeline_client: PipelineClient, temp_dir: Path)
         PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=0.05)
         mock_logger.warning.assert_called()
         assert "Very small debounce" in mock_logger.warning.call_args[0][0]
+
+
+def test_symlink_read_security_check(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that _read_file_data refuses to read symlinks."""
+    target = temp_dir / "target.json"
+    target.write_text("{}")
+    link = temp_dir / "link.json"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("Symlinks not supported")
+
+    handler = PipelineEventHandler(target, pipeline_client, 120.0)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(link))
+        assert data is None
+        assert "Target is a symlink" in mock_warn.call_args[0][0]
+
+
+def test_process_event_path_mismatch(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that events for files other than the target are ignored."""
+    target = temp_dir / "target.json"
+    target.touch()
+    other = temp_dir / "other.json"
+    other.touch()
+
+    handler = PipelineEventHandler(target, pipeline_client, 120.0)
+
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(other)
+
+    with patch.object(handler, "_read_file_data") as mock_read:
+        handler._process_event(event)
+        mock_read.assert_not_called()
+
+
+def test_runtime_symlink_swap(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that replacing a file with a symlink at runtime is detected and rejected."""
+    f = temp_dir / "swap_test.json"
+    f.write_text("{}")
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # 1. Valid read
+    assert handler._read_file_data(str(f)) is not None
+    
+    # 2. Swap to symlink
+    f.unlink()
+    target = temp_dir / "target.json"
+    target.write_text('{"hacked": true}')
+    try:
+        f.symlink_to(target)
+    except OSError:
+        pytest.skip("Symlinks not supported")
+        
+    # 3. Attempt read - should be rejected
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(f))
+        assert data is None
+        assert "Target is a symlink" in mock_warn.call_args[0][0]
+
+
+def test_event_path_traversal_resolution(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that event paths with traversal are correctly resolved and matched."""
+    f = temp_dir / "target.json"
+    f.write_text("{}")
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Construct a path with traversal that resolves to the target
+    # e.g. /tmp/dir/../dir/target.json
+    traversal_path = str(temp_dir / "subdir" / ".." / "target.json")
+    
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = traversal_path
+    
+    # Should resolve and process if it matches target
+    with patch.object(handler, "_read_file_data") as mock_read:
+        handler._process_event(event)
+        mock_read.assert_called()
+
+
+def test_parse_file_content_exceeds_limit_race_condition(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test rejection when file content exceeds limit despite stat reporting small size."""
+    f = temp_dir / "race_large.json"
+    # Write large content
+    large_content = " " * (MAX_FILE_SIZE_BYTES + 100)
+    f.write_text(large_content)
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    # Mock stat to return small size (simulating race condition or FS lag)
+    with patch.object(Path, "stat") as mock_stat:
+        mock_stat.return_value.st_size = 100
+        mock_stat.return_value.st_mode = stat.S_IFREG
+
+        with patch.object(handler.logger, "warning") as mock_warn:
+            data = handler._read_file_data(str(f))
+            assert data is None
+            
+            # Should warn about content exceeding limit
+            mock_warn.assert_called()
+            assert "content exceeds limit" in mock_warn.call_args[0][0]
+
+
+def test_parse_invalid_types_for_required_fields(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that non-string types for required fields are rejected."""
+    f = temp_dir / "invalid_types.json"
+    
+    scenarios = [
+        {"current_stage": 123, "current_task": "Task"},
+        {"current_stage": "Stage", "current_task": ["Task"]},
+        {"current_stage": {"nested": "dict"}, "current_task": "Task"},
+    ]
+    
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+    
+    for data in scenarios:
+        f.write_text(json.dumps(data))
+        # Read data
+        read_data = handler._read_file_data(str(f))
+        assert read_data is not None
+        
+        # Process state change
+        with patch.object(handler.logger, "warning") as mock_warn:
+            result = handler._process_state_change(read_data, str(f))
+            assert result is None
+            mock_warn.assert_called()
+            assert "must be a string" in mock_warn.call_args[0][0]
+
+
+def test_debounce_timer_cancellation_metrics(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that rapid events correctly cancel previous timers."""
+    f = temp_dir / "debounce.json"
+    f.touch()
+    
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=1.0)
+    
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+    
+    with patch("threading.Timer") as mock_timer_cls:
+        mock_timer_instance = MagicMock()
+        mock_timer_cls.return_value = mock_timer_instance
+        
+        # Simulate 100 rapid events
+        for _ in range(100):
+            handler.on_modified(event)
+            
+        # Timer should be started 100 times
+        assert mock_timer_cls.call_count == 100
+        # Previous timers should be cancelled. 
+        # On calls 2-100, self._timer is the previous mock (same instance), so cancel is called.
+        # Total cancel calls should be 99.
+        assert mock_timer_instance.cancel.call_count == 99
+        assert mock_timer_instance.start.call_count == 100
+
+
+def test_parse_value_error_handling(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test handling of ValueError during JSON parsing (e.g. limit exceeded in underlying lib)."""
+    f = temp_dir / "value_error.json"
+    f.write_text("{}")
+    
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+    
+    with patch("time.sleep"): # Skip backoff
+        with patch("json.loads", side_effect=ValueError("Limit exceeded")):
+            with patch.object(handler.logger, "error") as mock_error:
+                data = handler._read_file_data(str(f))
+                assert data is None
+                
+                # Should eventually log error after retries
+                mock_error.assert_called()
+                assert "Value error processing" in mock_error.call_args[0][0]
+
+
+def test_parse_os_error_during_read(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test handling of generic OSError during file read (not stat)."""
+    f = temp_dir / "os_error.json"
+    f.touch()
+    
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+    
+    with patch("time.sleep"):
+        # Mock open to succeed, but read to fail
+        with patch.object(Path, "open") as mock_open:
+            mock_file = MagicMock()
+            mock_file.__enter__.return_value.read.side_effect = OSError("IO Error")
+            mock_open.return_value = mock_file
+            
+            with patch.object(handler.logger, "error") as mock_error:
+                data = handler._read_file_data(str(f))
+                assert data is None
+                
+                mock_error.assert_called()
+                assert "Error processing" in mock_error.call_args[0][0]
+
+
+def test_event_path_traversal_escape(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that event paths traversing outside are ignored."""
+    f = temp_dir / "target.json"
+    f.touch()
+    outside = temp_dir / "outside.json"
+    outside.touch()
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Path that looks like it might be inside but traverses out
+    traversal_path = str(temp_dir / "subdir" / ".." / "outside.json")
+    
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = traversal_path
+    
+    with patch.object(handler, "_read_file_data") as mock_read:
+        handler._process_event(event)
+        mock_read.assert_not_called()
+
+def test_sensitive_file_symlink_attack(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that watcher refuses to read if target is a symlink to a sensitive file."""
+    # Simulate a sensitive file (e.g. /etc/passwd)
+    sensitive = temp_dir / "passwd"
+    sensitive.write_text("root:x:0:0:root:/root:/bin/bash")
+    
+    link = temp_dir / "link_to_passwd"
+    try:
+        link.symlink_to(sensitive)
+    except OSError:
+        pytest.skip("Symlinks not supported")
+        
+    handler = PipelineEventHandler(link, pipeline_client, 120.0)
+    
+    # Verify _read_file_data rejects the symlink explicitly
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(link))
+        assert data is None
+        assert "Target is a symlink" in mock_warn.call_args[0][0]
+
+
+def test_runtime_symlink_loop_read(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that a runtime symlink loop is handled gracefully."""
+    link1 = temp_dir / "loop1.json"
+    link2 = temp_dir / "loop2.json"
+    
+    # Create initial valid file
+    link1.write_text("{}")
+    
+    handler = PipelineEventHandler(link1, pipeline_client, 120.0)
+    
+    # 1. Valid read
+    assert handler._read_file_data(str(link1)) is not None
+    
+    # 2. Create loop
+    link1.unlink()
+    try:
+        link1.symlink_to(link2)
+        link2.symlink_to(link1)
+    except OSError:
+        pytest.skip("Symlinks not supported")
+        
+    # 3. Attempt read
+    # Should catch OSError (Too many levels of symbolic links) or RecursionError
+    with patch("time.sleep"):
+        data = handler._read_file_data(str(link1))
+        assert data is None
+
+
+def test_watcher_init_with_symlink_refusal(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that if Watcher is initialized with a symlink, it refuses to read."""
+    target = temp_dir / "target.json"
+    target.write_text("{}")
+    link = temp_dir / "link.json"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("Symlinks not supported")
+
+    watcher = PipelineWatcher(link, pipeline_client, 120.0)
+    # The watcher itself starts, but the handler should refuse to read
+    with patch.object(watcher.handler.logger, "warning") as mock_warn:
+        data = watcher.handler._read_file_data(str(link))
+        assert data is None
+        assert "Target is a symlink" in mock_warn.call_args[0][0]
+
+
+def test_read_file_data_checks_symlink_before_stat(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that _read_file_data checks is_symlink before performing stat (mitigation check)."""
+    f = temp_dir / "test.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Verify rejection path: if is_symlink returns True, stat should NOT be called
+    with patch.object(Path, "is_symlink", return_value=True) as mock_is_symlink:
+        with patch.object(Path, "stat") as mock_stat:
+            with patch.object(handler.logger, "warning") as mock_warn:
+                data = handler._read_file_data(str(f))
+                assert data is None
+                mock_is_symlink.assert_called()
+                mock_stat.assert_not_called()
+                assert "Target is a symlink" in mock_warn.call_args[0][0]
+
+
+def test_read_file_data_real_file_size_check(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that _read_file_data rejects large files using real stat check."""
+    f = temp_dir / "real_large.json"
+    # Write 11KB (MAX is 10KB)
+    f.write_text("x" * (11 * 1024))
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(f))
+        assert data is None
+        mock_warn.assert_called()
+        assert "too large" in mock_warn.call_args[0][0]
+
+
+def test_parse_actual_deep_nesting(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that actual deep nesting triggers RecursionError handling."""
+    f = temp_dir / "deep.json"
+
+    # Create deep nesting: {"a": {"a": ...}}
+    # Depth 1500 should trigger RecursionError in default Python (limit 1000)
+    depth = 1500
+    content = '{"a": ' * depth + '1' + '}' * depth
+    f.write_text(content)
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    # Bypass size checks to test recursion specifically
+    with patch.object(Path, "stat") as mock_stat:
+        mock_stat.return_value.st_size = 100  # Fake small size
+        mock_stat.return_value.st_mode = stat.S_IFREG
+
+        # Patch the constant used in _read_file_data
+        with patch("aw_watcher_pipeline_stage.watcher.MAX_FILE_SIZE_BYTES", 100000):
+            with patch.object(handler.logger, "error") as mock_error:
+                data = handler._read_file_data(str(f))
+                assert data is None
+
+                # Should catch RecursionError
+                mock_error.assert_called()
+                assert "recursion limit exceeded" in mock_error.call_args[0][0]
+
+
+def test_parse_truncated_json(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test handling of truncated JSON (valid encoding but invalid syntax)."""
+    f = temp_dir / "truncated.json"
+    f.write_text('{"current_stage": "Incomplete"')
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch.object(handler.logger, "debug") as mock_debug:
+        # Skip retries
+        with patch("time.sleep"):
+            data = handler._read_file_data(str(f))
+            assert data is None
+
+            # Verify it caught JSONDecodeError (logged as debug during retries)
+            assert any("Malformed JSON" in str(c) for c in mock_debug.call_args_list)
+
+
+def test_parse_invalid_optional_types(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that invalid types for optional fields are handled gracefully."""
+    f = temp_dir / "optional_types.json"
+    data = {
+        "current_stage": "S",
+        "current_task": "T",
+        "project_id": 12345,  # Should be string
+        "status": ["invalid"],  # Should be string
+        "start_time": 99999,  # Should be string
+    }
+    f.write_text(json.dumps(data))
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        result = handler._process_state_change(handler._read_file_data(str(f)), str(f))
+
+        # Should succeed but drop invalid fields
+        assert result is not None
+        assert result["current_stage"] == "S"
+        assert result["project_id"] is None
+        assert result["status"] == "in_progress"  # Default
+        assert result["start_time"] is None
+
+        # Verify warnings
+        warnings = [str(c) for c in mock_warn.call_args_list]
+        assert any("project_id must be a string" in w for w in warnings)
+        assert any("status must be a string" in w for w in warnings)
+        assert any("start_time must be a string" in w for w in warnings)
+
+
+def test_debounce_high_frequency_warning(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that high frequency events trigger a warning log."""
+    f = temp_dir / "rapid.json"
+    f.touch()
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=1.0)
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+
+    with patch("threading.Timer"):
+        with patch.object(handler.logger, "warning") as mock_warn:
+            # Trigger 51 events (threshold is 50)
+            for _ in range(51):
+                handler.on_modified(event)
+            
+            mock_warn.assert_called()
+            assert "High frequency file events detected" in mock_warn.call_args[0][0]
+
+
+def test_read_file_data_boundary_size(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test reading files at exact size limit and just above."""
+    f_ok = temp_dir / "ok.json"
+    f_ok.write_text("x" * MAX_FILE_SIZE_BYTES)
+    
+    f_large = temp_dir / "large.json"
+    f_large.write_text("x" * (MAX_FILE_SIZE_BYTES + 1))
+    
+    handler = PipelineEventHandler(f_ok, pipeline_client, 120.0)
+    
+    # 1. Exact limit should pass size check (though content might be invalid JSON)
+    # We mock json.loads to avoid decode error since "x"*N isn't valid JSON
+    with patch("json.loads", return_value={}):
+        assert handler._read_file_data(str(f_ok)) is not None
+        
+    # 2. Just above limit should fail
+    with patch.object(handler.logger, "warning") as mock_warn:
+        assert handler._read_file_data(str(f_large)) is None
+        assert "too large" in mock_warn.call_args[0][0]
+
+
+def test_read_file_data_unicode_retries(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that UnicodeDecodeError triggers retries."""
+    f = temp_dir / "bad_encoding.json"
+    with open(f, "wb") as binary:
+        binary.write(b"\x80\x81")
+        
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("time.sleep") as mock_sleep:
+        with patch.object(handler.logger, "debug") as mock_debug:
+            with patch.object(handler.logger, "warning") as mock_warn:
+                handler._read_file_data(str(f))
+                
+                # Should retry 4 times (total 5 attempts)
+                assert mock_sleep.call_count == 4
+                # Should log debug for retries
+                assert mock_debug.call_count >= 4
+                # Should log warning on final failure
+                mock_warn.assert_called_once()
+                assert "Encoding error" in mock_warn.call_args[0][0]
+
+
+def test_process_state_change_robustness(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test _process_state_change with unexpected types directly."""
+    f = temp_dir / "test.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # 1. Non-string stage
+    data_bad_stage = {"current_stage": 123, "current_task": "T"}
+    with patch.object(handler.logger, "warning") as mock_warn:
+        assert handler._process_state_change(data_bad_stage, str(f)) is None
+        assert "current_stage must be a string" in mock_warn.call_args[0][0]
+        
+    # 2. Non-string task
+    data_bad_task = {"current_stage": "S", "current_task": ["Task"]}
+    with patch.object(handler.logger, "warning") as mock_warn:
+        assert handler._process_state_change(data_bad_task, str(f)) is None
+        assert "current_task must be a string" in mock_warn.call_args[0][0]
+
+
+def test_read_file_utf16_be(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that UTF-16 encoded files trigger UnicodeDecodeError and are handled."""
+    f = temp_dir / "utf16.json"
+    data = json.dumps({"current_stage": "S", "current_task": "T"})
+    f.write_bytes(data.encode("utf-16-be"))
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch("time.sleep"):  # Skip backoff
+        with patch.object(handler.logger, "warning") as mock_warn:
+            # Should fail to decode as utf-8-sig
+            assert handler._read_file_data(str(f)) is None
+            # Should eventually log warning after retries
+            mock_warn.assert_called()
+            assert "Encoding error" in mock_warn.call_args[0][0]
+
+
+def test_parse_json_bool_values(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that boolean values for string fields are rejected."""
+    f = temp_dir / "bools.json"
+    f.write_text(json.dumps({"current_stage": True, "current_task": False}))
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(f))
+        assert data is not None
+        result = handler._process_state_change(data, str(f))
+        assert result is None
+
+        warnings = [str(c) for c in mock_warn.call_args_list]
+        assert any("current_stage must be a string" in w for w in warnings)
+
+
+def test_process_state_change_metadata_null(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that metadata set to null in JSON is handled as empty dict."""
+    f = temp_dir / "null_meta.json"
+    f.write_text(json.dumps({"current_stage": "S", "current_task": "T", "metadata": None}))
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(f))
+        assert data is not None
+        result = handler._process_state_change(data, str(f))
+
+        assert result is not None
+        assert result["metadata"] == {}
+        # Should warn about metadata not being a dict (NoneType)
+        mock_warn.assert_called()
+        assert "Metadata field" in mock_warn.call_args[0][0]
+
+
+def test_debounce_timer_replacement_verification(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that a new event replaces the existing timer instance."""
+    f = temp_dir / "timer.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=1.0)
+
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+
+    with patch("threading.Timer") as mock_timer_cls:
+        timer1 = MagicMock()
+        timer2 = MagicMock()
+        mock_timer_cls.side_effect = [timer1, timer2]
+
+        # First event
+        handler.on_modified(event)
+        assert handler._timer is timer1
+        timer1.start.assert_called_once()
+
+        # Second event
+        handler.on_modified(event)
+        assert handler._timer is timer2
+
+        # Verify first timer cancelled
+        timer1.cancel.assert_called_once()
+        timer2.start.assert_called_once()
+
+
+def test_read_file_data_whitespace_only(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that a file containing only whitespace is retried/skipped."""
+    f = temp_dir / "whitespace.json"
+    f.write_text("   \n   \t   ")
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch("time.sleep") as mock_sleep:
+        with patch.object(handler.logger, "debug") as mock_debug:
+            data = handler._read_file_data(str(f))
+            assert data is None
+
+            # Should have retried
+            assert mock_sleep.call_count >= 4
+            assert any("whitespace only" in str(c) for c in mock_debug.call_args_list)
+
+
+def test_process_state_change_invalid_status_type(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that invalid status type is handled gracefully."""
+    f = temp_dir / "test.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    data_bad_status = {"current_stage": "S", "current_task": "T", "status": 123}
+    with patch.object(handler.logger, "warning") as mock_warn:
+        res = handler._process_state_change(data_bad_status, str(f))
+        assert res is not None
+        assert res["status"] == "in_progress" # Default
+        assert "status must be a string" in mock_warn.call_args[0][0]
+
+
+def test_debounce_rapid_fire_execution(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that rapid events result in correct debounce counter and single execution."""
+    f = temp_dir / "debounce.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=1.0)
+    
+    callbacks = []
+    
+    class MockTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.function = function
+            self.args = args or []
+            self.kwargs = kwargs or {}
+            self.interval = interval
+            self.cancelled = False
+            self.daemon = False
+            
+        def cancel(self):
+            self.cancelled = True
+            
+        def start(self):
+            callbacks.append(self)
+            
+    with patch("threading.Timer", side_effect=MockTimer):
+        event = MagicMock()
+        event.is_directory = False
+        event.src_path = str(f)
+        
+        # Fire 100 events
+        for _ in range(100):
+            handler.on_modified(event)
+            
+        assert len(callbacks) == 100
+        
+        # Verify cancellation
+        for t in callbacks[:-1]:
+            assert t.cancelled
+        assert not callbacks[-1].cancelled
+        
+        last_timer = callbacks[-1]
+        
+        # Execute the last timer
+        with patch.object(handler, "_read_file_data", return_value={"current_stage": "S", "current_task": "T"}) as mock_read:
+            with patch.object(handler, "on_state_changed") as mock_change:
+                # Mock threading.current_thread to match the timer instance
+                with patch("threading.current_thread", return_value=last_timer):
+                    last_timer.function(*last_timer.args, **last_timer.kwargs)
+                    
+                    mock_read.assert_called_once()
+                    mock_change.assert_called_once()
+                    
+                    # Verify stats
+                    assert handler.total_debounced_events == 99
+                    assert handler._debounce_counter == 0
+
+
+def test_rate_limiting_dos_prevention(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that events are dropped when rate limit is exceeded."""
+    f = temp_dir / "rate_limit.json"
+    f.touch()
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+    # Reset tokens to allow controlled testing
+    handler._rate_limit_tokens = 5.0
+    handler._rate_limit_max = 5.0
+    handler._rate_limit_last_update = 1000.0
+
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+
+    # Freeze time so tokens don't refill
+    with patch("aw_watcher_pipeline_stage.watcher.time.monotonic", return_value=1000.0):
+        # Process 10 events
+        # First 5 should pass (tokens 5 -> 0)
+        # Next 5 should be dropped
+        for _ in range(10):
+            handler._process_event(event)
+
+    # Check dropped count
+    assert handler._dropped_events >= 5
+
+
+def test_json_decode_error_snippet_logging(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that a snippet of malformed JSON is logged in debug mode."""
+    f = temp_dir / "malformed.json"
+    f.write_text('{"broken": "json" ' + "x" * 100)  # Malformed
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    with patch("time.sleep"):  # Skip backoff
+        with patch.object(handler.logger, "debug") as mock_debug:
+            with patch.object(handler.logger, "isEnabledFor", return_value=True):
+                handler._read_file_data(str(f))
+
+                # Check for snippet log
+                assert any("JSON Snippet" in str(c) for c in mock_debug.call_args_list)
+
+
+def test_metadata_allowlist_filtering_in_watcher(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that metadata is filtered in watcher based on client allowlist."""
+    f = temp_dir / "allowlist.json"
+
+    # Configure client with allowlist
+    pipeline_client.metadata_allowlist = {"allowed_key"}
+
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    data = {
+        "current_stage": "S",
+        "current_task": "T",
+        "metadata": {"allowed_key": "yes", "blocked_key": "no"},
+    }
+
+    processed = handler._process_state_change(data, str(f))
+    assert processed is not None
+    assert "allowed_key" in processed["metadata"]
+    assert "blocked_key" not in processed["metadata"]
+
+
+def test_start_time_validation_in_watcher(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test validation of start_time format in watcher."""
+    f = temp_dir / "starttime.json"
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+
+    # Invalid format
+    data_invalid = {"current_stage": "S", "current_task": "T", "start_time": "not-a-date"}
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        processed = handler._process_state_change(data_invalid, str(f))
+        assert processed is not None
+        assert processed["start_time"] is None
+        assert any("Invalid timestamp format" in str(c) for c in mock_warn.call_args_list)
+
+    # Valid format
+    data_valid = {
+        "current_stage": "S",
+        "current_task": "T",
+        "start_time": "2023-01-01T12:00:00Z",
+    }
+    processed = handler._process_state_change(data_valid, str(f))
+    assert processed is not None
+    assert processed["start_time"] == "2023-01-01T12:00:00Z"
+
+
+def test_read_file_enforces_read_limit_arg(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that file.read() is called with exactly MAX_FILE_SIZE_BYTES + 1."""
+    f = temp_dir / "limit_check.json"
+    f.touch()
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Mock the file object returned by open()
+    with patch("pathlib.Path.open") as mock_open:
+        mock_file = MagicMock()
+        mock_open.return_value.__enter__.return_value = mock_file
+        mock_file.read.return_value = "{}"
+        
+        handler._read_file_data(str(f))
+        
+        # Verify read was called with limit
+        mock_file.read.assert_called_with(MAX_FILE_SIZE_BYTES + 1)
+
+
+def test_parse_truncated_utf8(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test handling of truncated UTF-8 sequences (valid start byte, missing continuation)."""
+    f = temp_dir / "truncated_utf8.json"
+    # 0xE2 is start of 3-byte sequence, but we stop there
+    with open(f, "wb") as binary:
+        binary.write(b'{"key": "val\xE2')
+        
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("time.sleep"): # Skip backoff
+        with patch.object(handler.logger, "warning") as mock_warn:
+            data = handler._read_file_data(str(f))
+            assert data is None
+            
+            # Should eventually log warning about encoding
+            mock_warn.assert_called()
+            assert "Encoding error" in mock_warn.call_args[0][0]
+
+
+def test_parse_deeply_nested_lists(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test RecursionError handling for deeply nested lists."""
+    f = temp_dir / "deep_list.json"
+    
+    # Create deep nesting: [[[[...]]]]
+    depth = 1500
+    content = '[' * depth + '1' + ']' * depth
+    f.write_text(content)
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Bypass size checks to hit recursion limit
+    with patch("aw_watcher_pipeline_stage.watcher.MAX_FILE_SIZE_BYTES", 100000):
+        with patch.object(handler.logger, "error") as mock_error:
+            data = handler._read_file_data(str(f))
+            assert data is None
+            
+            mock_error.assert_called()
+            assert "recursion limit exceeded" in mock_error.call_args[0][0]
+
+
+def test_process_state_change_multiple_invalid_fields(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test processing a state dict with multiple invalid fields simultaneously."""
+    f = temp_dir / "multi_invalid.json"
+    
+    data = {
+        "current_stage": 123, # Invalid
+        "current_task": ["Task"], # Invalid
+        "status": "unknown_status", # Invalid enum
+        "project_id": 456 # Invalid type
+    }
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch.object(handler.logger, "warning") as mock_warn:
+        result = handler._process_state_change(data, str(f))
+        
+        # Should return None because required fields are invalid
+        assert result is None
+        
+        # Verify warnings for the first encountered issue (stage)
+        warnings = [str(c) for c in mock_warn.call_args_list]
+        assert any("current_stage must be a string" in w for w in warnings)
+
+
+def test_debounce_metrics_update_on_fire(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that total_debounced_events metric is updated when the timer actually fires."""
+    f = temp_dir / "metrics.json"
+    f.touch()
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    handler._debounce_counter = 10
+    
+    # Mock read to return data so we proceed to metrics update
+    with patch.object(handler, "_read_file_data", return_value={"current_stage": "S", "current_task": "T"}):
+        with patch.object(handler, "on_state_changed"):
+            # Mock current thread to match timer check
+            handler._timer = threading.current_thread() # type: ignore
+            
+            handler._parse_file_wrapper(str(f))
+            
+            assert handler.total_debounced_events == 10
+            assert handler._debounce_counter == 0
+
+
+def test_parse_json_float_values(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that float values for string fields are rejected."""
+    f = temp_dir / "floats.json"
+    f.write_text(json.dumps({"current_stage": 1.5, "current_task": "Task"}))
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(f))
+        assert data is not None
+        result = handler._process_state_change(data, str(f))
+        assert result is None
+        
+        assert "current_stage must be a string" in mock_warn.call_args[0][0]
+
+
+def test_parse_large_file_incremental_growth(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test file growing from valid to invalid size."""
+    f = temp_dir / "growing.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    # 1. Valid size
+    f.write_text(json.dumps({"current_stage": "Small", "current_task": "Task"}))
+    assert handler._read_file_data(str(f)) is not None
+
+    # 2. Invalid size
+    f.write_text("x" * (MAX_FILE_SIZE_BYTES + 100))
+    with patch.object(handler.logger, "warning") as mock_warn:
+        assert handler._read_file_data(str(f)) is None
+        assert "too large" in mock_warn.call_args[0][0]
+
+
+def test_utf8_bom_with_invalid_body(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test file with valid BOM but invalid body bytes."""
+    f = temp_dir / "bom_invalid.json"
+    # BOM + invalid byte
+    f.write_bytes(b'\xef\xbb\xbf' + b'{"key": "\xff"}')
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("time.sleep"): # Skip backoff
+        with patch.object(handler.logger, "warning") as mock_warn:
+            assert handler._read_file_data(str(f)) is None
+            assert "Encoding error" in mock_warn.call_args[0][0]
+
+
+def test_deep_nesting_mixed_structure(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test recursion error with mixed dict/list nesting."""
+    f = temp_dir / "deep_mixed.json"
+    
+    # {"a": [{"a": ...}]}
+    depth = 800 # 800 * 2 = 1600 depth approx
+    content = '{"a": [' * depth + '1' + ']}' * depth
+    f.write_text(content)
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("aw_watcher_pipeline_stage.watcher.MAX_FILE_SIZE_BYTES", 100000):
+        with patch.object(handler.logger, "error") as mock_error:
+            assert handler._read_file_data(str(f)) is None
+            assert "recursion limit exceeded" in mock_error.call_args[0][0]
+
+
+def test_type_validation_all_fields_invalid(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test rejection when all fields have invalid types."""
+    f = temp_dir / "all_invalid.json"
+    data = {
+        "current_stage": 1,
+        "current_task": 2,
+        "project_id": 3,
+        "status": 4,
+        "start_time": 5,
+        "metadata": 6
+    }
+    f.write_text(json.dumps(data))
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch.object(handler.logger, "warning") as mock_warn:
+        # Read succeeds (valid JSON)
+        read_data = handler._read_file_data(str(f))
+        assert read_data is not None
+        
+        # Process fails
+        result = handler._process_state_change(read_data, str(f))
+        assert result is None
+        
+        # Verify warnings for required fields
+        warnings = [str(c) for c in mock_warn.call_args_list]
+        assert any("current_stage must be a string" in w for w in warnings)
+
+
+def test_debounce_flood_during_shutdown(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that events flooding during shutdown don't cause errors."""
+    f = temp_dir / "shutdown_flood.json"
+    f.touch()
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0, debounce_seconds=0.1)
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+    
+    # Start flooding
+    for _ in range(50):
+        handler.on_modified(event)
+        
+    # Stop handler
+    handler.stop()
+    
+    # Flood more
+    for _ in range(50):
+        handler.on_modified(event)
+        
+    # Should handle gracefully, timer should be cancelled
+    assert handler._stopped
+    if handler._timer:
+        assert not handler._timer.is_alive()
+
+
+def test_logging_of_large_skipped_files_throttled(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that large file warnings are throttled."""
+    f = temp_dir / "large_throttled.json"
+    f.write_text("x" * (MAX_FILE_SIZE_BYTES + 100))
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch.object(handler.logger, "warning") as mock_warn:
+        # 1. First read - logs warning
+        handler._read_file_data(str(f))
+        assert mock_warn.call_count == 1
+        
+        # 2. Second read immediately - no log
+        handler._read_file_data(str(f))
+        assert mock_warn.call_count == 1
+        
+        # 3. Third read after delay - logs warning
+        handler._last_file_size_warning_time -= 61.0
+        handler._read_file_data(str(f))
+        assert mock_warn.call_count == 2
+
+
+def test_parse_valid_json_exact_limit(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test parsing a valid JSON file that is exactly at the size limit."""
+    # Construct valid JSON to hit exactly MAX_FILE_SIZE_BYTES
+    # {"k": "..."}
+    # Overhead: {"k": ""} is 9 bytes.
+    # Padding needed: MAX - 9
+    padding_len = MAX_FILE_SIZE_BYTES - 9
+    data = {"k": "x" * padding_len}
+    json_str = json.dumps(data)
+    
+    # Verify assumption
+    assert len(json_str) == MAX_FILE_SIZE_BYTES
+    
+    f = temp_dir / "exact_limit.json"
+    f.write_text(json_str)
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Should succeed without warning
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data_read = handler._read_file_data(str(f))
+        assert data_read is not None
+        mock_warn.assert_not_called()
+
+
+def test_parse_json_with_comments(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that JSON with comments (invalid in standard JSON) is handled gracefully."""
+    f = temp_dir / "comments.json"
+    f.write_text('{\n  "current_stage": "Test",\n  // This is a comment\n  "current_task": "Task"\n}')
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("time.sleep"): # Skip backoff
+        with patch.object(handler.logger, "debug") as mock_debug:
+            data = handler._read_file_data(str(f))
+            assert data is None
+            # Should catch JSONDecodeError
+            assert any("Malformed JSON" in str(c) for c in mock_debug.call_args_list)
+
+
+def test_parse_json_trailing_commas(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that JSON with trailing commas (invalid) is handled."""
+    f = temp_dir / "trailing.json"
+    f.write_text('{"current_stage": "Test", "current_task": "Task",}')
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("time.sleep"):
+        with patch.object(handler.logger, "debug") as mock_debug:
+            data = handler._read_file_data(str(f))
+            assert data is None
+            assert any("Malformed JSON" in str(c) for c in mock_debug.call_args_list)
+
+
+def test_debounce_zero_seconds_immediate_execution(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that debounce_seconds=0.0 results in immediate execution."""
+    f = temp_dir / "zero_debounce.json"
+    f.touch()
+    
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=0.0)
+    
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+    
+    with patch("threading.Timer") as mock_timer_cls:
+        handler.on_modified(event)
+        
+        # Should still use Timer with 0.0 seconds
+        mock_timer_cls.assert_called_once()
+        args = mock_timer_cls.call_args
+        assert args[0][0] == 0.0
+        mock_timer_cls.return_value.start.assert_called_once()
+
+
+def test_parse_json_nan_handling(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that NaN values (valid in Python json, invalid in standard JSON) are handled."""
+    f = temp_dir / "nan.json"
+    f.write_text('{"current_stage": NaN, "current_task": "Task"}')
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # json.loads accepts NaN by default
+    data = handler._read_file_data(str(f))
+    assert data is not None
+    
+    # But _process_state_change expects strings
+    with patch.object(handler.logger, "warning") as mock_warn:
+        result = handler._process_state_change(data, str(f))
+        assert result is None
+        assert "current_stage must be a string" in mock_warn.call_args[0][0]
+
+
+def test_parse_json_recursion_small_file(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test recursion error on a file that is small in bytes but deep in nesting."""
+    f = temp_dir / "deep_small.json"
+    # Create a file that is small enough to pass size check but deep enough to crash default recursion limit
+    depth = 1200
+    content = '[' * depth + ']' * depth
+    f.write_text(content)
+    
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+    
+    # Temporarily lower recursion limit to ensure we trigger the error
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(500)
+    try:
+        with patch.object(handler.logger, "error") as mock_error:
+            # Should return None and log error
+            assert handler._read_file_data(str(f)) is None
+            
+            # Verify it was RecursionError
+            assert any("recursion limit exceeded" in str(c) for c in mock_error.call_args_list)
+    finally:
+        sys.setrecursionlimit(original_limit)
+
+
+def test_read_file_data_io_error_on_close(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test handling of IOError when closing the file (context manager exit)."""
+    f = temp_dir / "close_fail.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
+    
+    # Mock open to return a file whose __exit__ raises OSError
+    with patch("pathlib.Path.open") as mock_open:
+        mock_file = MagicMock()
+        mock_file.__enter__.return_value.read.return_value = "{}"
+        mock_file.__exit__.side_effect = OSError("Disk full on close")
+        mock_open.return_value = mock_file
+        
+        with patch("time.sleep"): # Skip backoff
+            with patch.object(handler.logger, "error") as mock_error:
+                # Should catch the error
+                assert handler._read_file_data(str(f)) is None
+                assert any("Error processing" in str(c) for c in mock_error.call_args_list)
+
+
+def test_large_valid_json_rejection(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that a valid JSON file exceeding the size limit is rejected."""
+    f = temp_dir / "large_valid.json"
+    # Create valid JSON > 10KB
+    # {"key": "..."}
+    # Overhead is ~10 chars. Content needs to be > 10240.
+    data = {"key": "a" * (10 * 1024 + 100)}
+    f.write_text(json.dumps(data))
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        assert handler._read_file_data(str(f)) is None
+        # Should verify warning log about size
+        assert any("too large" in str(c) for c in mock_warn.call_args_list)
+
+
+def test_malformed_utf8_middle_of_file(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test handling of invalid UTF-8 bytes in the middle of the file."""
+    f = temp_dir / "bad_utf8.json"
+    # Valid start, bad byte 0xFF, valid end
+    with open(f, "wb") as binary:
+        binary.write(b'{"key": "val\xffue"}')
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    with patch("time.sleep"):  # Skip backoff
+        with patch.object(handler.logger, "warning") as mock_warn:
+            assert handler._read_file_data(str(f)) is None
+            assert any("Encoding error" in str(c) for c in mock_warn.call_args_list)
+
+
+def test_unexpected_types_mixed_validity(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test state processing with mixed valid and invalid types."""
+    f = temp_dir / "mixed_types.json"
+    # Stage is invalid (int), Task is valid (str)
+    data = {"current_stage": 12345, "current_task": "Valid Task"}
+    f.write_text(json.dumps(data))
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    # Read should succeed
+    read_data = handler._read_file_data(str(f))
+    assert read_data is not None
+
+    # Process should fail
+    with patch.object(handler.logger, "warning") as mock_warn:
+        result = handler._process_state_change(read_data, str(f))
+        assert result is None
+        assert any("current_stage must be a string" in str(c) for c in mock_warn.call_args_list)
+
+
+def test_debounce_rapid_events_timer_args(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Verify that the debounce timer is initialized with correct args."""
+    f = temp_dir / "timer_args.json"
+    f.touch()
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0, debounce_seconds=0.5)
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+
+    with patch("threading.Timer") as mock_timer_cls:
+        handler.on_modified(event)
+
+        mock_timer_cls.assert_called_once()
+        args, kwargs = mock_timer_cls.call_args
+        assert args[0] == 0.5  # interval
+        assert args[1] == handler._parse_file_wrapper  # function
+        assert kwargs["args"] == [str(handler.target_file)]  # args
+
+
+def test_debounce_rapid_events_timing_simulation(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """
+    Simulate rapid events and verify timer reset logic using manual time advancement.
+    Mock 100 events in <1s -> verify only 1 processed.
+    """
+    f = temp_dir / "rapid_timing.json"
+    f.touch()
+    
+    # Debounce 2.0s
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=2.0)
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+    
+    # Mock Timer to capture instances
+    timers = []
+    class MockTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.interval = interval
+            self.function = function
+            self.args = args or []
+            self.kwargs = kwargs or {}
+            self.cancelled = False
+            
+        def cancel(self):
+            self.cancelled = True
+            
+        def start(self):
+            timers.append(self)
+            
+    with patch("threading.Timer", side_effect=MockTimer):
+        with patch("aw_watcher_pipeline_stage.watcher.time.monotonic") as mock_time:
+            start_time = 1000.0
+            mock_time.return_value = start_time
+            
+            # Fire 100 events over 1 second (every 0.01s)
+            for i in range(100):
+                mock_time.return_value = start_time + (i * 0.01)
+                handler.on_modified(event)
+                
+            # We should have created 100 timers
+            assert len(timers) == 100
+            
+            # All but the last should be cancelled
+            for t in timers[:-1]:
+                assert t.cancelled
+            assert not timers[-1].cancelled
+            
+            # Now simulate time passing to 1003.0 and execute the last timer
+            mock_time.return_value = 1003.0
+            last_timer = timers[-1]
+            
+            # Mock read/process
+            with patch.object(handler, "_read_file_data", return_value={"current_stage": "Final", "current_task": "T"}):
+                with patch.object(handler, "on_state_changed") as mock_change:
+                    # Mock current_thread to match timer
+                    with patch("threading.current_thread", return_value=last_timer):
+                        last_timer.function(*last_timer.args, **last_timer.kwargs)
+                        
+                        mock_change.assert_called_once()
+                        # Verify debounce counter
+                        assert handler.total_debounced_events == 99
+
+
+def test_process_state_change_strict_types_subclass(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that subclasses of str are accepted in state change."""
+    f = temp_dir / "types.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    class MyStr(str):
+        pass
+        
+    data = {
+        "current_stage": MyStr("Stage"),
+        "current_task": MyStr("Task"),
+        "status": MyStr("in_progress")
+    }
+    
+    # Should be accepted
+    result = handler._process_state_change(data, str(f))
+    assert result is not None
+    assert result["current_stage"] == "Stage"
+    assert result["current_task"] == "Task"
+
+
+def test_parse_json_unescaped_control_chars(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that unescaped control characters (invalid JSON) are handled."""
+    f = temp_dir / "control.json"
+    # Newline inside string is invalid in JSON
+    f.write_text('{"key": "line\nbreak"}')
+    
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("time.sleep"):
+        with patch.object(handler.logger, "debug") as mock_debug:
+            assert handler._read_file_data(str(f)) is None
+            assert any("Malformed JSON" in str(c) for c in mock_debug.call_args_list)
+
+
+def test_read_file_data_race_dir_conversion(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test handling of IsADirectoryError raised during open() (race condition)."""
+    f = temp_dir / "race_dir.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    # Mock stat to succeed (return file), but open to raise IsADirectoryError
+    with patch.object(Path, "stat") as mock_stat:
+        mock_stat.return_value.st_mode = stat.S_IFREG
+        mock_stat.return_value.st_size = 10
+        
+        with patch.object(Path, "open", side_effect=IsADirectoryError("Is a directory")):
+            with patch.object(handler.logger, "warning") as mock_warn:
+                data = handler._read_file_data(str(f))
+                assert data is None
+                mock_warn.assert_called_with(f"Target path is a directory, skipping parse: {f}")
+
+
+def test_parse_file_wrapper_timer_cleanup_on_error(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that _timer is cleared even if an error occurs in the wrapper."""
+    f = temp_dir / "error.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Set a dummy timer object to simulate active state
+    handler._timer = threading.current_thread() # type: ignore
+    
+    # Mock _read_file_data to raise exception
+    with patch.object(handler, "_read_file_data", side_effect=RuntimeError("Boom")):
+        with patch.object(handler.logger, "error"): # Suppress log
+            handler._parse_file_wrapper(str(f))
+            
+    # Timer should be cleared
+    assert handler._timer is None
+
+
+def test_process_state_change_project_id_non_string(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that non-string project_id is ignored and warned."""
+    f = temp_dir / "test.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    data = {"current_stage": "S", "current_task": "T", "project_id": 12345}
+    
+    with patch.object(handler.logger, "warning") as mock_warn:
+        result = handler._process_state_change(data, str(f))
+        
+        assert result is not None
+        assert result["project_id"] is None
+        assert any("project_id must be a string" in str(c) for c in mock_warn.call_args_list)
+
+
+def test_process_state_change_status_normalization(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that status is normalized to lowercase."""
+    f = temp_dir / "test.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    data = {"current_stage": "S", "current_task": "T", "status": "In_Progress"}
+    
+    result = handler._process_state_change(data, str(f))
+    assert result is not None
+    assert result["status"] == "in_progress"
+
+
+def test_read_file_data_permission_error_throttling(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that PermissionError logging is throttled."""
+    f = temp_dir / "perm.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    with patch("time.sleep"): # Skip backoff
+        with patch.object(Path, "open", side_effect=PermissionError("Access denied")):
+            with patch.object(handler.logger, "error") as mock_error:
+                # 1. First call - logs error
+                handler._read_file_data(str(f))
+                assert mock_error.call_count == 1
+                
+                # 2. Second call immediately - no log
+                handler._read_file_data(str(f))
+                assert mock_error.call_count == 1
+                
+                # 3. Third call after delay - logs error
+                handler.last_read_error_time -= 61.0
+                handler._read_file_data(str(f))
+                assert mock_error.call_count == 2
+
+
+def test_large_file_rejection_metrics(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that large file rejection does not increment parse_errors (as it's a pre-check)."""
+    f = temp_dir / "large_metrics.json"
+    # Write content larger than 10KB
+    f.write_text("x" * (10 * 1024 + 100))
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        handler._read_file_data(str(f))
+        # Should verify warning log
+        assert any("too large" in str(c) for c in mock_warn.call_args_list)
+
+    # Should be 0 because it's skipped before parsing attempt
+    assert handler.parse_errors == 0
+
+
+def test_malformed_utf8_metrics(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that invalid UTF-8 increments parse_errors."""
+    f = temp_dir / "utf8_metrics.json"
+    with open(f, "wb") as binary:
+        binary.write(b"\x80\x81")
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    with patch("time.sleep"):  # Skip backoff
+        with patch.object(handler.logger, "warning"):
+            handler._read_file_data(str(f))
+
+    assert handler.parse_errors == 1
+
+
+def test_recursion_error_metrics(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that recursion error increments parse_errors."""
+    f = temp_dir / "recursion_metrics.json"
+    f.write_text("{}")  # Content doesn't matter as we mock json.loads
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    with patch("aw_watcher_pipeline_stage.watcher.json.loads", side_effect=RecursionError("Boom")):
+        with patch("time.sleep"):
+            with patch.object(handler.logger, "error"):
+                handler._read_file_data(str(f))
+
+    assert handler.parse_errors == 1
+
+
+def test_unexpected_types_metrics(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that invalid types for required fields increment parse_errors."""
+    f = temp_dir / "types_metrics.json"
+    data = {"current_stage": 123, "current_task": "Task"}
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    with patch.object(handler.logger, "warning"):
+        handler._process_state_change(data, str(f))
+
+    assert handler.parse_errors == 1
+
+
+def test_debounce_load_timer_usage(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that rapid events use threading.Timer and do not block (no sleep)."""
+    f = temp_dir / "load.json"
+    f.touch()
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0, debounce_seconds=1.0)
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+
+    with patch("threading.Timer") as mock_timer_cls:
+        with patch("time.sleep") as mock_sleep:
+            # Fire 100 events
+            for _ in range(100):
+                handler.on_modified(event)
+
+            # Should not sleep (blocking)
+            mock_sleep.assert_not_called()
+
+            # Should have created 100 timers (cancelled previous ones)
+            assert mock_timer_cls.call_count == 100
+
+
+def test_stress_large_json_boundary(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test exact boundary conditions for file size limit."""
+    f = temp_dir / "boundary.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    # 1. Exactly MAX_FILE_SIZE_BYTES
+    # We use a valid JSON structure to avoid JSONDecodeError
+    # {"a": "..."} -> 10 bytes overhead.
+    padding = MAX_FILE_SIZE_BYTES - 10
+    content_exact = '{"a": "' + ("x" * padding) + '"}'
+    assert len(content_exact) == MAX_FILE_SIZE_BYTES
+    f.write_text(content_exact)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(f))
+        assert data is not None
+        # Should NOT log "too large"
+        assert not any("too large" in str(c) for c in mock_warn.call_args_list)
+
+    # 2. MAX_FILE_SIZE_BYTES + 1
+    content_over = content_exact + " "
+    f.write_text(content_over)
+
+    with patch.object(handler.logger, "warning") as mock_warn:
+        data = handler._read_file_data(str(f))
+        assert data is None
+        assert any("too large" in str(c) for c in mock_warn.call_args_list)
+
+
+def test_stress_malformed_utf8_sequences(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test various malformed UTF-8 sequences."""
+    f = temp_dir / "utf8_stress.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    sequences = [
+        b"\xff",              # Invalid start byte
+        b"\xc0\xaf",          # Overlong encoding
+        b"\xe0\x80\x80",      # Overlong encoding
+        b"\xf0\x80\x80\x80",  # Overlong encoding
+        b"\xed\xa0\x80",      # Surrogate half
+    ]
+
+    with patch("time.sleep"):  # Skip backoff
+        for seq in sequences:
+            with open(f, "wb") as binary:
+                binary.write(seq)
+
+            # Reset error tracking to ensure log is emitted
+            handler.last_read_error_time = 0.0
+
+            with patch.object(handler.logger, "warning") as mock_warn:
+                assert handler._read_file_data(str(f)) is None
+                # Should eventually log warning
+                assert any("Encoding error" in str(c) for c in mock_warn.call_args_list)
+
+
+def test_stress_debounce_flood_drop(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that flooding events triggers rate limiting drops."""
+    f = temp_dir / "flood.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+
+    # Reset tokens to a known low value
+    handler._rate_limit_tokens = 5.0
+    handler._rate_limit_max = 100.0
+
+    # Freeze time so tokens don't refill
+    with patch("aw_watcher_pipeline_stage.watcher.time.monotonic", return_value=1000.0):
+        # Fire 10 events. First 5 should pass (tokens 5->0). Next 5 should drop.
+        for _ in range(10):
+            handler.on_modified(event)
+
+    assert handler._dropped_events >= 5
+
+
+def test_parse_file_wrapper_state_consistency(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that state remains consistent if read fails inside wrapper."""
+    f = temp_dir / "wrapper_fail.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    # Set initial state
+    handler.last_stage = "Initial"
+
+    # Mock read to return None (failure)
+    with patch.object(handler, "_read_file_data", return_value=None):
+        # Mock timer identity
+        handler._timer = threading.current_thread()  # type: ignore
+
+        handler._parse_file_wrapper(str(f))
+
+        # State should be unchanged
+        assert handler.last_stage == "Initial"
+        # Timer should be cleared
+        assert handler._timer is None
+
+
+@pytest.mark.parametrize("mode", [stat.S_IFBLK, stat.S_IFCHR, stat.S_IFIFO])
+def test_read_file_data_non_regular_files_parametrized(pipeline_client: PipelineClient, temp_dir: Path, mode: int) -> None:
+    """Test that various non-regular files (Block, Char, FIFO) are skipped."""
+    f = temp_dir / "special_file"
+    f.touch()
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    with patch.object(Path, "stat") as mock_stat:
+        mock_stat.return_value.st_mode = mode
+
+        with patch.object(handler.logger, "warning") as mock_warn:
+            assert handler._read_file_data(str(f)) is None
+            assert "not a regular file" in mock_warn.call_args[0][0]
+
+
+def test_process_state_change_metadata_nested_preservation(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that nested metadata dictionaries are preserved as-is in watcher state."""
+    f = temp_dir / "test.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    metadata = {"config": {"nested": {"deep": "value"}}}
+    data = {"current_stage": "S", "current_task": "T", "metadata": metadata}
+
+    result = handler._process_state_change(data, str(f))
+    assert result is not None
+    assert result["metadata"] == metadata
+
+
+def test_process_state_change_project_id_whitespace(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that project_id whitespace is stripped."""
+    f = temp_dir / "test.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    data = {"current_stage": "S", "current_task": "T", "project_id": "  my-project  "}
+
+    result = handler._process_state_change(data, str(f))
+    assert result is not None
+    assert result["project_id"] == "my-project"
+
+
+def test_process_state_change_start_time_whitespace(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that start_time whitespace is stripped."""
+    f = temp_dir / "test.json"
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    data = {"current_stage": "S", "current_task": "T", "start_time": "  2023-01-01T12:00:00Z  "}
+
+    result = handler._process_state_change(data, str(f))
+    assert result is not None
+    assert result["start_time"] == "2023-01-01T12:00:00Z"
+
+
+def test_debounce_timer_daemon_status(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that the debounce timer is set as a daemon thread."""
+    f = temp_dir / "test.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0, debounce_seconds=1.0)
+
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+
+    with patch("threading.Timer") as mock_timer_cls:
+        handler.on_modified(event)
+
+        mock_timer_instance = mock_timer_cls.return_value
+        assert mock_timer_instance.daemon is True

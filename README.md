@@ -5,7 +5,7 @@ ActivityWatch watcher for development pipeline stages.
 This watcher monitors a local `current_task.json` file and automatically logs your current development stage and task to ActivityWatch. It is designed to be lightweight, offline-first, and privacy-focused.
 
 ## Status
-Last Major Change: Stage 3.5.1 - Documentation refined (Installation, Usage, Troubleshooting).
+Last Major Change: Stage 4 Security Audit complete; mitigations applied.
 
 ## Installation
 

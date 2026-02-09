@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from configparser import ConfigParser, Error as ConfigParserError
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -30,6 +31,7 @@ class Config:
         log_level: Logging level (e.g., INFO, DEBUG).
         pulsetime: Time in seconds to wait before considering a task finished.
         debounce_seconds: Time in seconds to debounce file events.
+        metadata_allowlist: Optional list of allowed metadata keys.
     """
 
     watch_path: str
@@ -39,6 +41,7 @@ class Config:
     log_level: str
     pulsetime: float
     debounce_seconds: float
+    metadata_allowlist: Optional[List[str]]
 
 
 def _find_project_root(start_path: Path) -> Optional[Path]:
@@ -89,6 +92,81 @@ def _get_config_file_paths() -> List[str]:
         )
     return paths
 
+def _validate_path(path_str: str, is_log: bool = False) -> str:
+    """Resolve and validate path security.
+
+    Performs strict resolution to canonicalize paths and prevent traversal.
+    Checks for regular file type and permissions.
+    """
+    try:
+        path = Path(os.path.expanduser(path_str))
+        
+        # Resolve strictly to canonical path
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            # If not found, resolve parent strictly (for creation/waiting)
+            try:
+                parent = path.parent.resolve(strict=True)
+                resolved = parent / path.name
+            except (FileNotFoundError, RuntimeError, OSError):
+                logger.error(f"Invalid path (parent directory not found): {path}")
+                sys.exit(1)
+        except (RuntimeError, OSError) as e:
+            logger.error(f"Error resolving path {path}: {e}")
+            sys.exit(1)
+            
+        if not is_log:
+            # For watch_path, if it's a directory, append default file
+            if resolved.is_dir():
+                resolved = resolved / "current_task.json"
+                # Re-resolve if exists to ensure canonical
+                if resolved.exists():
+                    resolved = resolved.resolve(strict=True)
+            
+            # Check if it is a regular file (if it exists)
+            if resolved.exists():
+                if not resolved.is_file():
+                    logger.error(f"Invalid path: Watch path is not a regular file (directories/devices not allowed): {resolved}")
+                    sys.exit(1)
+                # Check read permission
+                try:
+                    with resolved.open('r'):
+                        pass
+                except PermissionError:
+                    logger.error(f"Read permission denied for watch path: {resolved}")
+                    sys.exit(1)
+        else:
+            # For log_file
+            if resolved.exists():
+                if not resolved.is_file():
+                    logger.error(f"Invalid path: Log file is not a regular file: {resolved}")
+                    sys.exit(1)
+                # Check write permission
+                try:
+                    with resolved.open('a'):
+                        pass
+                except PermissionError:
+                    logger.error(f"Write permission denied for log file: {resolved}")
+                    sys.exit(1)
+            else:
+                # Try creating to verify permissions
+                try:
+                    with resolved.open('a'):
+                        pass
+                except PermissionError:
+                    logger.error(f"Cannot create log file (permission denied): {resolved}")
+                    sys.exit(1)
+                except OSError as e:
+                    logger.error(f"Cannot create log file: {e}")
+                    sys.exit(1)
+
+        return str(resolved)
+
+    except Exception as e:
+        logger.error(f"Path validation failed for '{path_str}': {e}")
+        sys.exit(1)
+
 def load_config(cli_args: Dict[str, Any]) -> Config:
     """Load configuration with priority: CLI > Env > Config File > Defaults.
 
@@ -109,6 +187,7 @@ def load_config(cli_args: Dict[str, Any]) -> Config:
         "log_level": "INFO",
         "pulsetime": 120.0,
         "debounce_seconds": 1.0,
+        "metadata_allowlist": None,
     }
 
     # 2. Config File (simple INI support)
@@ -138,6 +217,7 @@ def load_config(cli_args: Dict[str, Any]) -> Config:
         "AW_WATCHER_LOG_LEVEL": "log_level",
         "AW_WATCHER_PULSETIME": "pulsetime",
         "AW_WATCHER_DEBOUNCE_SECONDS": "debounce_seconds",
+        "AW_WATCHER_METADATA_ALLOWLIST": "metadata_allowlist",
     }
     for env_var, config_key in env_map.items():
         val = os.getenv(env_var)
@@ -165,10 +245,18 @@ def load_config(cli_args: Dict[str, Any]) -> Config:
         if config_values["debounce_seconds"] < 0:
             raise ValueError(f"debounce_seconds must be non-negative, got {config_values['debounce_seconds']}")
 
+    if config_values["metadata_allowlist"] is not None:
+        if isinstance(config_values["metadata_allowlist"], str):
+            # Parse comma-separated string into list
+            config_values["metadata_allowlist"] = [
+                k.strip()
+                for k in config_values["metadata_allowlist"].split(",")
+                if k.strip()
+            ]
+
     # Expand user path for watch_path (e.g. ~)
     if config_values["watch_path"]:
-        config_values["watch_path"] = str(config_values["watch_path"])
-        config_values["watch_path"] = os.path.expanduser(config_values["watch_path"])
+        config_values["watch_path"] = _validate_path(str(config_values["watch_path"]), is_log=False)
     else:
         # Default to git root if available, else "."
         try:
@@ -179,14 +267,14 @@ def load_config(cli_args: Dict[str, Any]) -> Config:
             root = None
 
         if root:
-            config_values["watch_path"] = str(root)
+            raw_path = str(root)
         else:
             logger.debug("No project root found, defaulting watch_path to '.'")
-            config_values["watch_path"] = "."
+            raw_path = "."
+        config_values["watch_path"] = _validate_path(raw_path, is_log=False)
 
     if config_values["log_file"]:
-        config_values["log_file"] = str(config_values["log_file"])
-        config_values["log_file"] = os.path.expanduser(config_values["log_file"])
+        config_values["log_file"] = _validate_path(str(config_values["log_file"]), is_log=True)
 
     # Handle boolean conversion for testing
     if isinstance(config_values["testing"], str):

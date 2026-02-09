@@ -60,11 +60,6 @@ def setup_logging(log_level: str, log_file: Optional[str]) -> None:
 
     if log_file:
         try:
-            # Ensure directory exists
-            log_path = Path(log_file)
-            if log_path.parent and not log_path.parent.exists():
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-
             file_handler = logging.FileHandler(log_file)
             file_handler.setFormatter(formatter)
             handlers.append(file_handler)
@@ -216,7 +211,10 @@ def main() -> None:
         "--watch-path", type=str, default=None, help="Path to the directory to watch."
     )
     parser.add_argument(
-        "--port", type=int, default=None, help="Port of the ActivityWatch server (default: 5600)."
+        "--port",
+        type=int,
+        default=None,
+        help="Port of the ActivityWatch server (default: 5600).",
     )
     parser.add_argument(
         "--testing", action="store_true", default=None, help="Run in testing mode."
@@ -251,12 +249,8 @@ def main() -> None:
     logger.info(f"Starting aw-watcher-pipeline-stage v{__version__} (PID: {os.getpid()})...")
     logger.info("Privacy Notice: This watcher runs 100% locally and sends no telemetry.")
 
-    # Resolve watch path once to ensure consistency between Client and Watcher
-    try:
-        watch_path = Path(config.watch_path).absolute()
-    except OSError as e:
-        logger.error(f"Invalid watch path '{config.watch_path}': {e}")
-        sys.exit(1)
+    # Watch path is already resolved and validated in config
+    watch_path = Path(config.watch_path)
 
     # Initialize variables for cleanup safety
     client: Optional[PipelineClient] = None

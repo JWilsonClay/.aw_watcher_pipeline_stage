@@ -20,7 +20,7 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = "^3.8"
-aw-client = "^0.5.12"
+aw-client = "^0.8.0"
 watchdog = "^4.0.0"
 
 [tool.poetry.group.dev.dependencies]
@@ -32,6 +32,7 @@ pytest-cov = "^4.1.0"
 pytest-mock = "^3.12.0"
 types-setuptools = "^69.0.0"
 psutil = "^6.0.0"
+hypothesis = "^6.0.0"
 
 [tool.poetry.scripts]
 aw-watcher-pipeline-stage = "aw_watcher_pipeline_stage.main:main"
