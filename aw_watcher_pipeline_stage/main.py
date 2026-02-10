@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import os
 import signal
@@ -257,6 +258,34 @@ def main() -> None:
     watcher: Optional[PipelineWatcher] = None
     resource_timer: Optional[threading.Timer] = None
 
+    # Define cleanup function
+    def cleanup() -> None:
+        nonlocal resource_timer
+        if resource_timer:
+            resource_timer.cancel()
+            resource_timer = None
+
+        # Log final resource usage
+        log_resource_usage(watcher)
+
+        if watcher:
+            try:
+                watcher.stop()
+            except Exception as e:
+                logger.error(f"Error stopping watcher in cleanup: {e}")
+
+        if client:
+            try:
+                client.flush_queue()
+            except Exception as e:
+                logger.error(f"Error flushing queue: {e}")
+            try:
+                client.close()
+            except Exception as e:
+                logger.error(f"Error closing client: {e}")
+
+    atexit.register(cleanup)
+
     # Event to signal shutdown
     stop_event = threading.Event()
 
@@ -280,7 +309,7 @@ def main() -> None:
 
         # Wait for server before starting watcher (with timeout for offline support)
         # We wait up to 5 seconds for the server to appear, otherwise we proceed.
-        client.wait_for_start(timeout=5.0)
+        client.wait_for_start(timeout=5.0, stop_check=stop_event.is_set)
 
         # Ensure bucket exists (or queue creation if offline)
         try:
@@ -363,26 +392,8 @@ def main() -> None:
         logger.error(f"Fatal error: {e}")
         sys.exit(1)
     finally:
-        if resource_timer:
-            resource_timer.cancel()
-        # Ensure we log final resource usage on exit
-        log_resource_usage(watcher)
-        if watcher:
-            try:
-                watcher.stop()
-            except Exception as e:
-                logger.error(f"Error stopping watcher in finally block: {e}")
-        
-        # Ensure client is cleaned up
-        if client:
-            try:
-                client.flush_queue()
-            except Exception as e:
-                logger.error(f"Error flushing queue: {e}")
-            try:
-                client.close()
-            except Exception as e:
-                logger.error(f"Error closing client: {e}")
+        cleanup()
+        atexit.unregister(cleanup)
 
 
 if __name__ == "__main__":

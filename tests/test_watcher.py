@@ -462,7 +462,7 @@ def test_read_file_data_empty_retry(pipeline_client: PipelineClient, temp_dir: P
 
 def test_parse_race_condition_deletion(pipeline_client: PipelineClient, temp_dir: Path) -> None:
     f = temp_dir / "current_task.json"
-    f.touch()
+    f.write_text("{}")
 
     handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
 
@@ -1408,7 +1408,7 @@ def test_creation_debounce_integration(
         mock_aw_client.heartbeat.assert_not_called()
 
         # Wait rest of debounce
-        time.sleep(1.0)
+        time.sleep(1.2)
         mock_aw_client.heartbeat.assert_called_once()
         assert mock_aw_client.heartbeat.call_args[0][1].data["stage"] == "Created"
 
@@ -4115,7 +4115,7 @@ def test_parse_value_error_handling(pipeline_client: PipelineClient, temp_dir: P
 def test_parse_os_error_during_read(pipeline_client: PipelineClient, temp_dir: Path) -> None:
     """Test handling of generic OSError during file read (not stat)."""
     f = temp_dir / "os_error.json"
-    f.touch()
+    f.write_text("{}")
     
     handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
     
@@ -4578,6 +4578,42 @@ def test_debounce_rapid_fire_execution(pipeline_client: PipelineClient, temp_dir
                     assert handler._debounce_counter == 0
 
 
+def test_batch_limit_trigger(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that reaching batch_size_limit triggers immediate processing."""
+    f = temp_dir / "batch_limit.json"
+    f.touch()
+    
+    # Set debounce high to ensure timer wouldn't fire naturally
+    handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0, debounce_seconds=10.0)
+    handler.batch_size_limit = 5
+    
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = str(f)
+    
+    with patch("threading.Timer") as mock_timer_cls:
+        # 1. Add 4 events (below limit)
+        for _ in range(4):
+            handler.on_modified(event)
+            
+        # Should have scheduled normal debounce (10.0s)
+        assert mock_timer_cls.call_count == 1
+        args, _ = mock_timer_cls.call_args
+        assert args[0] == 10.0
+        
+        # 2. Add 5th event (hit limit)
+        handler.on_modified(event)
+        
+        # Should have scheduled immediate check (0.0s)
+        assert mock_timer_cls.call_count == 2
+        args, _ = mock_timer_cls.call_args
+        assert args[0] == 0.0
+        
+        # Verify previous timer cancelled
+        mock_timer_instance = mock_timer_cls.return_value
+        mock_timer_instance.cancel.assert_called()
+
+
 def test_rate_limiting_dos_prevention(pipeline_client: PipelineClient, temp_dir: Path) -> None:
     """Test that events are dropped when rate limit is exceeded."""
     f = temp_dir / "rate_limit.json"
@@ -4670,7 +4706,7 @@ def test_start_time_validation_in_watcher(pipeline_client: PipelineClient, temp_
 def test_read_file_enforces_read_limit_arg(pipeline_client: PipelineClient, temp_dir: Path) -> None:
     """Test that file.read() is called with exactly MAX_FILE_SIZE_BYTES + 1."""
     f = temp_dir / "limit_check.json"
-    f.touch()
+    f.write_text("{}")
     
     handler = PipelineEventHandler(f, pipeline_client, 120.0)
     
@@ -5031,7 +5067,7 @@ def test_parse_json_recursion_small_file(pipeline_client: PipelineClient, temp_d
 def test_read_file_data_io_error_on_close(pipeline_client: PipelineClient, temp_dir: Path) -> None:
     """Test handling of IOError when closing the file (context manager exit)."""
     f = temp_dir / "close_fail.json"
-    f.touch()
+    f.write_text("{}")
     handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
     
     # Mock open to return a file whose __exit__ raises OSError
@@ -5285,7 +5321,7 @@ def test_process_state_change_status_normalization(pipeline_client: PipelineClie
 def test_read_file_data_permission_error_throttling(pipeline_client: PipelineClient, temp_dir: Path) -> None:
     """Test that PermissionError logging is throttled."""
     f = temp_dir / "perm.json"
-    f.touch()
+    f.write_text("{}")
     handler = PipelineEventHandler(f, pipeline_client, 120.0)
     
     with patch("time.sleep"): # Skip backoff
@@ -5557,3 +5593,34 @@ def test_debounce_timer_daemon_status(pipeline_client: PipelineClient, temp_dir:
 
         mock_timer_instance = mock_timer_cls.return_value
         assert mock_timer_instance.daemon is True
+
+
+def test_read_file_data_caching(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that _read_file_data uses cache when mtime/size are unchanged."""
+    f = temp_dir / "cache.json"
+    f.write_text(json.dumps({"key": "val"}))
+
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+
+    # 1. First read - should open file
+    with patch.object(Path, "open", wraps=Path(f).open) as mock_open:
+        data1 = handler._read_file_data(str(f))
+        assert data1 == {"key": "val"}
+        mock_open.assert_called_once()
+
+    # 2. Second read - unchanged file - should skip open (cache hit)
+    with patch.object(Path, "open", wraps=Path(f).open) as mock_open:
+        data2 = handler._read_file_data(str(f))
+        assert data2 == {"key": "val"}
+        mock_open.assert_not_called()
+
+    # 3. Modify file (mtime/size changes)
+    # Ensure mtime changes by sleeping slightly if needed, but write usually updates it
+    time.sleep(0.01)
+    f.write_text(json.dumps({"key": "val2"}))
+
+    # 4. Third read - changed file - should open
+    with patch.object(Path, "open", wraps=Path(f).open) as mock_open:
+        data3 = handler._read_file_data(str(f))
+        assert data3 == {"key": "val2"}
+        mock_open.assert_called_once()

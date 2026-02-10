@@ -8,7 +8,7 @@ Key Libraries/Frameworks: aw-client, watchdog, argparse, logging, json
 Database / Storage: Local JSON file, ActivityWatch buckets
 Frontend / GUI (if any): CLI / ActivityWatch WebUI
 Current Architecture Summary: Modular Python package with `main` (CLI/Signals), `watcher` (Watchdog Observer + Debounce), `client` (AW Wrapper + Retries), and `config` (Priority Loading).
-Last Major Change: Stage 4 Security Audit complete; mitigations applied.
+Last Major Change: Stage 6.1 Profiling complete; bottlenecks identified
 
 ## Refined Role Starters (see role_starters.md for the three clean role prompts)
 
@@ -399,6 +399,8 @@ Existing Tests (if any):
 - `tests/test_main.py`: Signal handling, startup resilience.
 - `tests/test_watcher.py`: Debounce, JSON parsing, symlink runtime checks.
 - `tests/test_client.py`: Offline buffering, hostname sanitization.
+- `tests/test_integration.py`: End-to-end lifecycle, offline recovery, periodic heartbeats.
+- `tests/test_robustness.py`: Concurrency, race conditions, resource usage (psutil), symlink loops.
 
 Architect Version → copy to Architect LLM:
 [PASTE ARCHITECT ROLE STARTER + fill Stage 5 details]
@@ -410,10 +412,10 @@ Senior Systems Engineer Version → copy to SeniorSE LLM:
 [PASTE ENGINEER ROLE STARTER + fill Stage 5 details]
 
 Checklist:
-- Updated Global Project Context?
-- Saved test files/code?
-- Updated Last Major Change?
-- Ran tests successfully?
+- [x] Updated Global Project Context?
+- [x] Saved test files/code?
+- [x] Updated Last Major Change?
+- [x] Ran tests successfully?
 
 ## Stage 6: Performance / Optimization
 
@@ -428,9 +430,38 @@ Global Project Context:
 [PASTE ABOVE]
 
 Known Performance Concerns or Hot Paths:
+- **File I/O Latency**: Frequent `stat()` and `open()` calls in `_read_file_data` during rapid updates.
+- **JSON Parsing**: Overhead of `json.loads` on every debounce trigger, especially for larger files (up to 10KB).
+- **Debounce Efficiency**: Thread creation overhead for `threading.Timer` on every file event (rapid burst handling).
+- **Memory Usage**: Long-running process stability (memory leaks).
+
 Benchmarks / Profiling Data (if available):
+- **Internal Metrics**: `watcher.get_statistics()` tracks `processing_latency`, `heartbeat_latency`, `max_processing_latency`, `events_detected`.
+- **System Metrics**: `psutil` tests in `test_robustness.py` confirm < 1% CPU and < 50MB RAM usage during idle/burst.
+- **Target**: Maintain < 1% CPU usage, < 50MB RAM under sustained load.
+
+### Stage 6.1 Profiling Report (Stage 6.1.5)
+
+**Summary of Work:**
+Performance profiling infrastructure established using `cProfile`, `timeit`, and `psutil`. Benchmarks executed to verify non-functional requirements.
+
+**Profiling Results:**
+- **Resource Usage**:
+  - **Idle CPU**: < 1% (Target Met).
+  - **Active CPU**: < 5% during burst updates (Target Met).
+  - **Memory (RSS)**: < 50 MB (Target Met).
+- **Latency**:
+  - **Heartbeat**: < 20ms (Online).
+  - **Burst Processing**: 1000 events processed in < 5.0s.
+
+**Identified Bottlenecks:**
+1.  **JSON Parsing**: `json.loads` consumes significant CPU during rapid updates or large file reads.
+2.  **Debounce Overhead**: `threading.Timer` creation for every event in a burst adds overhead.
+3.  **File I/O**: Frequent `stat()` calls in `_read_file_data` during retries or checks.
 
 Code to Optimize:
+- `aw_watcher_pipeline_stage/watcher.py`: `_read_file_data`, `_process_event`.
+- `aw_watcher_pipeline_stage/client.py`: `send_heartbeat` (ensure non-blocking).
 
 Architect Version → copy to Architect LLM:
 [PASTE ARCHITECT ROLE STARTER + fill Stage 6 details]

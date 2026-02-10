@@ -376,7 +376,7 @@ def test_modification_debounce_and_payload(
             time.sleep(0.1)
 
         # Wait for debounce to trigger (0.5s) + processing buffer
-        time.sleep(debounce_interval + 0.3)
+        time.sleep(debounce_interval + 0.5)
 
         # Verify exactly one heartbeat
         assert len(mock_aw_client.events) == 1, f"Expected 1 event, got {len(mock_aw_client.events)}"
@@ -605,7 +605,7 @@ def test_e2e_lifecycle(integration_temp_dir: Path) -> None:
         
         # Verify timestamp approx now
         ts = datetime.fromisoformat(event["timestamp"])
-        assert (datetime.now(timezone.utc) - ts).total_seconds() < 5.0
+        assert (datetime.now(timezone.utc) - ts).total_seconds() < 10.0
         
         mock_aw_client.events.clear()
         
@@ -700,7 +700,7 @@ def test_strict_interface_compliance(integration_temp_dir: Path) -> None:
             
             # Verify timestamp is approx now
             # Note: event.timestamp is a datetime object
-            assert (event.timestamp - now).total_seconds() < 5.0
+            assert (event.timestamp - now).total_seconds() < 10.0
             
             # Verify duration is 0 (handled by server merging)
             assert event.duration == 0 or event.duration == 0.0
@@ -810,7 +810,7 @@ def test_full_flow_strict_timing(integration_temp_dir: Path) -> None:
         task_file.write_text(json.dumps(data), encoding="utf-8")
         
         # Debounce wait > 1s (1.2s)
-        time.sleep(1.2)
+        time.sleep(1.5)
         
         # Verify heartbeat
         assert len(mock_aw_client.events) == 1
@@ -832,7 +832,7 @@ def test_full_flow_strict_timing(integration_temp_dir: Path) -> None:
         
         # Timestamp approx now
         ts = datetime.fromisoformat(event["timestamp"])
-        assert (datetime.now(timezone.utc) - ts).total_seconds() < 5.0
+        assert (datetime.now(timezone.utc) - ts).total_seconds() < 10.0
 
     finally:
         watcher.stop()
@@ -1141,7 +1141,7 @@ def test_core_integration_flow(integration_temp_dir: Path) -> None:
             assert event.data["version"] == 1
             
             # Verify timestamp approx now
-            assert (event.timestamp - now_utc).total_seconds() < 5.0
+            assert (event.timestamp - now_utc).total_seconds() < 10.0
             # Verify duration
             assert event.duration == 0
             

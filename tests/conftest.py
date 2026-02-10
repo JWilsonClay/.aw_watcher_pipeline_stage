@@ -1,6 +1,8 @@
 from pathlib import Path
-from typing import Callable, Generator, Union, cast
+import sys
+from typing import Any, Callable, Generator, Union, cast
 from unittest.mock import MagicMock, patch
+import tempfile
 
 import pytest
 
@@ -12,9 +14,13 @@ from aw_watcher_pipeline_stage.config import Config
 
 
 @pytest.fixture
-def temp_dir(tmp_path: Path) -> Path:
-    """Fixture for a temporary directory using pytest's tmp_path."""
-    return tmp_path
+def temp_dir() -> Generator[Path, None, None]:
+    """Fixture for a temporary directory using tempfile.TemporaryDirectory.
+
+    Ensures automatic cleanup after test execution.
+    """
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        yield Path(tmpdirname)
 
 
 @pytest.fixture
@@ -68,6 +74,14 @@ def mock_time(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 @pytest.fixture
+def mock_monotonic(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Mock time.monotonic for deterministic timing."""
+    mock = MagicMock(return_value=1000.0)
+    monkeypatch.setattr("time.monotonic", mock)
+    return mock
+
+
+@pytest.fixture
 def mock_config() -> Config:
     """Fixture for a default Config object."""
     return Config(
@@ -101,3 +115,48 @@ def cli_args(monkeypatch: pytest.MonkeyPatch) -> Callable[[list[str]], None]:
     def _set_args(args: list[str]) -> None:
         monkeypatch.setattr("sys.argv", ["aw-watcher-pipeline-stage"] + args)
     return _set_args
+
+
+@pytest.fixture
+def mock_psutil(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Mock psutil for deterministic resource usage checks."""
+    mock_psutil_mod = MagicMock()
+    mock_psutil_mod.process_iter.return_value = []
+    mock_psutil_mod.virtual_memory.return_value.percent = 15.5
+    mock_psutil_mod.cpu_percent.return_value = 10.0
+
+    # Mock Process class
+    mock_process = MagicMock()
+    mock_process.memory_info.return_value.rss = 1024 * 1024 * 50  # 50MB
+    mock_psutil_mod.Process.return_value = mock_process
+
+    monkeypatch.setitem(sys.modules, "psutil", mock_psutil_mod)
+    return mock_psutil_mod
+
+
+@pytest.fixture
+def offline_aw_client(mock_aw_client: MagicMock) -> MagicMock:
+    """Mock aw-client that simulates offline behavior (ConnectionError then success)."""
+    # Fail 3 times, then succeed
+    mock_aw_client.heartbeat.side_effect = [
+        ConnectionError("Offline"),
+        ConnectionError("Offline"),
+        ConnectionError("Offline"),
+        None
+    ]
+    return mock_aw_client
+
+
+@pytest.fixture
+def flood_events() -> Callable[[Any, int], None]:
+    """Fixture to simulate event flooding on a handler."""
+    def _flood(handler: Any, count: int) -> None:
+        event = MagicMock()
+        event.is_directory = False
+        if hasattr(handler, "target_file"):
+            event.src_path = str(handler.target_file)
+        else:
+            event.src_path = "test_file.json"
+        for _ in range(count):
+            handler.on_modified(event)
+    return _flood

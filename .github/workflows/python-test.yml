@@ -31,6 +31,7 @@ jobs:
     - name: Install dependencies
       run: |
         poetry install --with dev --no-interaction
+        poetry run pip install psutil
 
     - name: Run pre-commit hooks (Black, Isort, Mypy)
       run: |
@@ -41,6 +42,7 @@ jobs:
         poetry run pip install pip-audit
         poetry run pip-audit --desc
 
-    - name: Run tests with coverage
+    - name: Run full test suite with coverage (Unit, Integration, Robustness)
+      timeout-minutes: 10
       run: |
-        poetry run pytest --cov=aw_watcher_pipeline_stage --cov-report=term-missing --cov-fail-under=90
+        poetry run pytest -v --cov=aw_watcher_pipeline_stage --cov-report=term-missing --cov-fail-under=90

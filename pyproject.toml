@@ -22,6 +22,7 @@ classifiers = [
 python = "^3.8"
 aw-client = "^0.8.0"
 watchdog = "^4.0.0"
+orjson = {version = "^3.0", optional = true}
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.0.0"
@@ -33,6 +34,11 @@ pytest-mock = "^3.12.0"
 types-setuptools = "^69.0.0"
 psutil = "^6.0.0"
 hypothesis = "^6.0.0"
+line_profiler = "^4.1.0"
+memory_profiler = "^0.61.0"
+
+[tool.poetry.extras]
+performance = ["orjson"]
 
 [tool.poetry.scripts]
 aw-watcher-pipeline-stage = "aw_watcher_pipeline_stage.main:main"

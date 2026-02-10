@@ -5,7 +5,7 @@ ActivityWatch watcher for development pipeline stages.
 This watcher monitors a local `current_task.json` file and automatically logs your current development stage and task to ActivityWatch. It is designed to be lightweight, offline-first, and privacy-focused.
 
 ## Status
-Last Major Change: Stage 4 Security Audit complete; mitigations applied.
+Last Major Change: Stage 5 Testing Strategy complete; comprehensive coverage achieved.
 
 ## Installation
 
@@ -121,6 +121,28 @@ The watcher expects a JSON file (default `current_task.json`) with the following
 **4. Permission errors**
 - **Cause**: The watcher does not have read access to the file or directory.
 - **Fix**: Check file permissions (`chmod`) or run the watcher with appropriate user privileges.
+
+## Testing
+
+This project uses `pytest` for testing and `pytest-cov` for coverage reporting.
+
+### Running Tests
+To run the full test suite with coverage report:
+
+```bash
+poetry run pytest --cov=aw_watcher_pipeline_stage --cov-report=term-missing
+```
+
+### Viewing Coverage
+To generate an HTML coverage report:
+
+```bash
+poetry run coverage html
+# Open htmlcov/index.html in your browser
+```
+
+### CI/CD
+Tests are automatically run via GitHub Actions on every push and pull request. See `.github/workflows/python-test.yml` for the configuration.
 
 ## Contributing
 
