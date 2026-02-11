@@ -75,6 +75,8 @@ def test_main_execution(
     mock_config.log_level = "INFO"
     mock_config.log_file = None
     mock_config.debounce_seconds = 1.0
+    mock_config.metadata_allowlist = None
+    mock_config.batch_size_limit = 5
     mock_load_config.return_value = mock_config
 
     mock_client_instance = mock_client_cls.return_value
@@ -99,6 +101,7 @@ def test_main_execution(
         port=mock_config.port,
         testing=mock_config.testing,
         pulsetime=mock_config.pulsetime,
+        metadata_allowlist=mock_config.metadata_allowlist,
     )
     mock_client_instance.wait_for_start.assert_called_once_with(timeout=5.0)
     mock_client_instance.ensure_bucket.assert_called_once()
@@ -106,8 +109,8 @@ def test_main_execution(
     mock_watcher_cls.assert_called_once_with(
         mock_config.watch_path,
         mock_client_instance,
-        pulsetime=mock_config.pulsetime,
         debounce_seconds=mock_config.debounce_seconds,
+        batch_size_limit=mock_config.batch_size_limit,
     )
     mock_watcher_instance.start.assert_called_once()
     
@@ -762,8 +765,8 @@ def test_main_log_file_directory_failure(tmp_path: Path) -> None:
 @patch("sys.exit")
 def test_main_log_file_traversal_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
     """Test that main exits if log file path traversal fails validation."""
-    # Simulate load_config raising SystemExit due to validation failure
-    mock_load_config.side_effect = SystemExit(1)
+    # Simulate load_config raising ValueError due to validation failure
+    mock_load_config.side_effect = ValueError("Validation failed")
     
     with patch.object(sys, "argv", ["prog", "--log-file", "../../../etc/passwd"]):
         try:
@@ -778,8 +781,8 @@ def test_main_log_file_traversal_exit(mock_exit: MagicMock, mock_load_config: Ma
 @patch("sys.exit")
 def test_main_watch_path_traversal_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
     """Test that main exits if watch path traversal fails validation."""
-    # Simulate load_config raising SystemExit due to validation failure
-    mock_load_config.side_effect = SystemExit(1)
+    # Simulate load_config raising ValueError due to validation failure
+    mock_load_config.side_effect = ValueError("Validation failed")
     
     with patch.object(sys, "argv", ["prog", "--watch-path", "../../../etc/passwd"]):
         try:
@@ -795,7 +798,7 @@ def test_main_watch_path_traversal_exit(mock_exit: MagicMock, mock_load_config: 
 @patch("sys.exit")
 def test_main_watch_path_symlink_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
     """Test that main exits if watch path is a symlink (simulated validation failure)."""
-    mock_load_config.side_effect = SystemExit(1)
+    mock_load_config.side_effect = ValueError("Validation failed")
     
     with patch.object(sys, "argv", ["prog", "--watch-path", "symlink.json"]):
         try:
@@ -811,8 +814,8 @@ def test_main_watch_path_symlink_exit(mock_exit: MagicMock, mock_load_config: Ma
 @patch("sys.exit")
 def test_main_log_file_parent_failure(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
     """Test that main exits if log file parent directory does not exist."""
-    # Simulate load_config raising SystemExit due to validation failure
-    mock_load_config.side_effect = SystemExit(1)
+    # Simulate load_config raising ValueError due to validation failure
+    mock_load_config.side_effect = ValueError("Validation failed")
     
     with patch.object(sys, "argv", ["prog", "--log-file", "/nonexistent/dir/log.txt"]):
         try:
@@ -827,8 +830,8 @@ def test_main_log_file_parent_failure(mock_exit: MagicMock, mock_load_config: Ma
 @patch("sys.exit")
 def test_main_watch_path_permission_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
     """Test that main exits if watch path permission is denied."""
-    # Simulate load_config raising SystemExit due to permission failure
-    mock_load_config.side_effect = SystemExit(1)
+    # Simulate load_config raising ValueError due to permission failure
+    mock_load_config.side_effect = ValueError("Validation failed")
     
     with patch.object(sys, "argv", ["prog", "--watch-path", "/nopermission.json"]):
         try:
@@ -844,7 +847,7 @@ def test_main_watch_path_permission_exit(mock_exit: MagicMock, mock_load_config:
 @patch("sys.exit")
 def test_main_log_file_symlink_exit(mock_exit: MagicMock, mock_load_config: MagicMock) -> None:
     """Test that main exits if log file is a symlink (simulated validation failure)."""
-    mock_load_config.side_effect = SystemExit(1)
+    mock_load_config.side_effect = ValueError("Validation failed")
     
     with patch.object(sys, "argv", ["prog", "--log-file", "symlink.log"]):
         try:
@@ -854,3 +857,34 @@ def test_main_log_file_symlink_exit(mock_exit: MagicMock, mock_load_config: Magi
             pass
             
     mock_load_config.assert_called()
+
+
+def test_argparse_testing_flag_defaults_none() -> None:
+    """Test that --testing flag defaults to None (not False) to allow config override."""
+    from aw_watcher_pipeline_stage.main import main
+    
+    class ExitTest(Exception): pass
+
+    with patch("aw_watcher_pipeline_stage.main.load_config") as mock_load:
+        # Mock load_config to return a dummy config so main proceeds
+        mock_config = MagicMock()
+        mock_config.log_level = "INFO"
+        mock_config.log_file = None
+        mock_load.return_value = mock_config
+
+        with patch("aw_watcher_pipeline_stage.main.PipelineClient", side_effect=ExitTest), \
+             patch("aw_watcher_pipeline_stage.main.setup_logging"):
+            
+            # Run without --testing
+            with patch.object(sys, "argv", ["prog"]):
+                with pytest.raises(ExitTest):
+                    main()
+            args = mock_load.call_args[0][0]
+            assert args["testing"] is None
+
+            # Run with --testing
+            with patch.object(sys, "argv", ["prog", "--testing"]):
+                with pytest.raises(ExitTest):
+                    main()
+            args = mock_load.call_args[0][0]
+            assert args["testing"] is True

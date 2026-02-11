@@ -36,6 +36,7 @@ psutil = "^6.0.0"
 hypothesis = "^6.0.0"
 line_profiler = "^4.1.0"
 memory_profiler = "^0.61.0"
+pydocstyle = "^6.3.0"
 
 [tool.poetry.extras]
 performance = ["orjson"]
@@ -63,3 +64,14 @@ show_missing = true
 strict = true
 ignore_missing_imports = true
 files = ["aw_watcher_pipeline_stage", "tests"]
+
+[tool.pydocstyle]
+convention = "google"
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+line_length = 88

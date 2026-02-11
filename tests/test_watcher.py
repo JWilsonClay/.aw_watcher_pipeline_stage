@@ -1426,11 +1426,11 @@ def test_parse_encoding_error(pipeline_client: PipelineClient, temp_dir: Path) -
     with patch("time.sleep"):
         handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
 
-        with patch.object(handler.logger, "warning") as mock_warn:
+        with patch.object(handler.logger, "error") as mock_error:
             handler._read_file_data(str(f))
-            mock_warn.assert_called_once()
+            mock_error.assert_called_once()
             # The error message might vary slightly depending on where it was caught, but should be logged
-            assert "Encoding error" in mock_warn.call_args[0][0]
+            assert "Encoding error" in mock_error.call_args[0][0]
 
 
 def test_on_deleted_oserror(pipeline_client: PipelineClient, temp_dir: Path) -> None:
@@ -1518,8 +1518,8 @@ def test_observer_restart_logic(pipeline_client: PipelineClient, temp_dir: Path)
         assert new_observer.is_alive()
         
         # Verify log message
-        assert mock_logger.error.call_count >= 1
-        assert "Watchdog observer found dead" in str(mock_logger.error.call_args)
+        assert mock_logger.critical.call_count >= 1
+        assert "Watchdog observer found dead" in str(mock_logger.critical.call_args)
 
     watcher.stop()
 
@@ -1580,8 +1580,8 @@ def test_periodic_heartbeat_restarts_observer(pipeline_client: PipelineClient, t
         watcher.check_health()
 
         # Should have logged warning
-        assert mock_logger.error.call_count >= 1
-        assert "Watchdog observer found dead" in str(mock_logger.error.call_args)
+        assert mock_logger.critical.call_count >= 1
+        assert "Watchdog observer found dead" in str(mock_logger.critical.call_args)
 
     # Verify restarted
     assert watcher.observer is not original_observer
@@ -1683,7 +1683,7 @@ def test_observer_persistent_failure(pipeline_client: PipelineClient, temp_dir: 
                     watcher.start()
             
             # Should have logged final error
-            assert any("Could not start observer" in str(c) for c in mock_logger.error.call_args_list)
+            assert any("Could not start observer" in str(c) for c in mock_logger.critical.call_args_list)
             # Should have retried max times (3)
             assert obs.start.call_count == 3
 
@@ -1725,7 +1725,7 @@ def test_observer_restart_failure_recovery(pipeline_client: PipelineClient, temp
                 new_observer = watcher.observer
 
                 # Should have logged error for the dead observer
-                assert any("Watchdog observer found dead" in str(c) for c in mock_logger.error.call_args_list)
+                assert any("Watchdog observer found dead" in str(c) for c in mock_logger.critical.call_args_list)
                 # Should have logged error for the failed restart attempt
                 assert any("Failed to start observer" in str(c) for c in mock_logger.error.call_args_list)
 
@@ -1764,7 +1764,7 @@ def test_observer_restart_persistent_failure(pipeline_client: PipelineClient, te
                 # Should have retried 3 times
                 assert obs_fail.start.call_count == 3
                 # Should have logged error
-                assert any("Could not start observer" in str(c) for c in mock_logger.error.call_args_list)
+                assert any("Could not start observer" in str(c) for c in mock_logger.critical.call_args_list)
                 # Returned observer should be dead
                 assert not current_obs.is_alive()
 
@@ -1962,8 +1962,8 @@ def test_restart_fails_missing_directory(pipeline_client: PipelineClient, temp_d
             obs = watcher.observer
 
             # Should have logged errors
-            assert mock_logger.error.call_count >= 1
-            assert "Could not start observer" in str(mock_logger.error.call_args_list[-1])
+            assert mock_logger.critical.call_count >= 1
+            assert "Could not start observer" in str(mock_logger.critical.call_args_list[-1])
 
             # Observer should be present but not alive
             assert not obs.is_alive()
@@ -2004,7 +2004,7 @@ def test_recovery_scenario_via_heartbeat_check(
         watcher.check_health()
         
         # Verify log
-        assert any("Watchdog observer found dead" in str(c) for c in mock_logger.error.call_args_list)
+        assert any("Watchdog observer found dead" in str(c) for c in mock_logger.critical.call_args_list)
 
     # 4. Verify restart
     new_observer = watcher.observer
@@ -4419,12 +4419,12 @@ def test_read_file_utf16_be(pipeline_client: PipelineClient, temp_dir: Path) -> 
     handler = PipelineEventHandler(f, pipeline_client, pulsetime=120.0)
 
     with patch("time.sleep"):  # Skip backoff
-        with patch.object(handler.logger, "warning") as mock_warn:
+        with patch.object(handler.logger, "error") as mock_error:
             # Should fail to decode as utf-8-sig
             assert handler._read_file_data(str(f)) is None
             # Should eventually log warning after retries
-            mock_warn.assert_called()
-            assert "Encoding error" in mock_warn.call_args[0][0]
+            mock_error.assert_called()
+            assert "Encoding error" in mock_error.call_args[0][0]
 
 
 def test_parse_json_bool_values(pipeline_client: PipelineClient, temp_dir: Path) -> None:
@@ -4847,9 +4847,9 @@ def test_utf8_bom_with_invalid_body(pipeline_client: PipelineClient, temp_dir: P
     handler = PipelineEventHandler(f, pipeline_client, 120.0)
     
     with patch("time.sleep"): # Skip backoff
-        with patch.object(handler.logger, "warning") as mock_warn:
+        with patch.object(handler.logger, "error") as mock_error:
             assert handler._read_file_data(str(f)) is None
-            assert "Encoding error" in mock_warn.call_args[0][0]
+            assert "Encoding error" in mock_error.call_args[0][0]
 
 
 def test_deep_nesting_mixed_structure(pipeline_client: PipelineClient, temp_dir: Path) -> None:
@@ -5111,9 +5111,9 @@ def test_malformed_utf8_middle_of_file(pipeline_client: PipelineClient, temp_dir
     handler = PipelineEventHandler(f, pipeline_client, 120.0)
 
     with patch("time.sleep"):  # Skip backoff
-        with patch.object(handler.logger, "warning") as mock_warn:
+        with patch.object(handler.logger, "error") as mock_error:
             assert handler._read_file_data(str(f)) is None
-            assert any("Encoding error" in str(c) for c in mock_warn.call_args_list)
+            assert any("Encoding error" in str(c) for c in mock_error.call_args_list)
 
 
 def test_unexpected_types_mixed_validity(pipeline_client: PipelineClient, temp_dir: Path) -> None:
@@ -5395,7 +5395,7 @@ def test_unexpected_types_metrics(pipeline_client: PipelineClient, temp_dir: Pat
 
     handler = PipelineEventHandler(f, pipeline_client, 120.0)
 
-    with patch.object(handler.logger, "warning"):
+    with patch.object(handler.logger, "error"):
         handler._process_state_change(data, str(f))
 
     assert handler.parse_errors == 1

@@ -1,4 +1,28 @@
-"""ActivityWatch client wrapper for the pipeline watcher."""
+"""ActivityWatch client wrapper for the pipeline watcher.
+
+This module encapsulates all communication with the ActivityWatch server (aw-server).
+It handles bucket creation, heartbeat transmission, and connection management.
+It implements a non-blocking, offline-first design using a background worker thread
+and local queuing.
+
+Key Responsibilities:
+  * **Bucket Creation**: Ensuring the bucket exists with the correct type and hostname.
+  * **Queued Heartbeats**: Buffering events locally when the server is offline.
+  * **Offline Resilience**: Retrying connections and managing the event queue.
+
+Design:
+  * **Offline Resilience**: All operations use `queued=True` where possible. Heartbeats
+    are buffered locally if the server is unreachable.
+  * **Non-blocking**: The `send_heartbeat` method returns immediately, offloading
+    serialization and network I/O to a background worker thread.
+  * **Privacy**: Enforces local-only operation (no telemetry) and sanitizes payloads
+    (e.g., anonymizing home directory paths).
+
+Invariants:
+  * **Pulsetime**: Defaults to 120s to allow server-side merging of events.
+  * **No Telemetry**: No external network calls are made; only localhost communication.
+  * **Thread Safety**: The client is thread-safe for sending heartbeats.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +42,15 @@ try:
 except ImportError:
     # Fallback for when aw-core is not installed
     class Event:  # type: ignore
+        """Fallback Event class when aw-core is not available."""
+
         def __init__(self, timestamp: Any = None, data: Optional[Dict[str, Any]] = None) -> None:
+            """Initialize the fallback Event.
+
+            Args:
+                timestamp: The event timestamp.
+                data: The event data payload.
+            """
             self.timestamp = timestamp
             self.data = data or {}
 
@@ -38,26 +70,78 @@ else:
     json_dumps = json.dumps
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 class MockActivityWatchClient:
-    """Mock client for testing without a running AW server."""
+    """Mock the ActivityWatch client for testing without a running AW server.
+
+    Simulate the behavior of the official ActivityWatchClient, storing buckets
+    and events in memory for verification.
+
+    Attributes:
+        buckets (Dict[str, Any]): Dictionary of created buckets.
+        events (List[Dict[str, Any]]): List of sent events.
+        client_hostname (str): Hostname used for bucket creation.
+        metadata_allowlist (Optional[Set[str]]): Set of allowed metadata keys.
+    """
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the mock client.
+
+        Args:
+            *args: Variable length argument list passed to parent.
+            **kwargs: Arbitrary keyword arguments passed to parent.
+        """
         self.buckets: Dict[str, Any] = {}
         self.events: List[Dict[str, Any]] = []
         self.client_hostname = "test-host"
         self.metadata_allowlist: Optional[Set[str]] = None
 
     def connect(self) -> None:
+        """Establish mock connection.
+
+        Simulates connecting to the ActivityWatch server.
+
+        Returns:
+            None
+        """
         pass
 
     def disconnect(self) -> None:
+        """Disconnect mock client.
+
+        Simulates disconnecting from the ActivityWatch server.
+
+        Returns:
+            None
+        """
         pass
 
     def create_bucket(self, bucket_id: str, event_type: str, queued: bool = False) -> None:
+        """Create mock bucket.
+
+        Args:
+            bucket_id (str): The bucket identifier.
+            event_type (str): The event type.
+            queued (bool): Whether to queue the creation if offline.
+
+        Returns:
+            None
+        """
         self.buckets[bucket_id] = {"event_type": event_type, "queued": queued}
 
     def heartbeat(self, bucket_id: str, event: Event, pulsetime: float = 0.0, queued: bool = False) -> None:
+        """Send mock heartbeat.
+
+        Args:
+            bucket_id (str): The bucket identifier.
+            event (Event): The event to send.
+            pulsetime (float): The pulsetime for the heartbeat.
+            queued (bool): Whether to queue the heartbeat if offline.
+
+        Returns:
+            None
+        """
         self.events.append({
             "bucket_id": bucket_id,
             "data": event.data,
@@ -67,21 +151,47 @@ class MockActivityWatchClient:
         })
 
     def get_info(self) -> Dict[str, Any]:
+        """Get mock server info.
+
+        Returns:
+            Mock server info dictionary.
+        """
         return {"version": "mock"}
 
     def flush(self) -> None:
+        """Flush mock queue.
+
+        Simulates flushing the event queue.
+
+        Returns:
+            None
+        """
         logger.info("[MOCK] flush: Queue flushed")
 
 
 VALID_STATUSES = {"in_progress", "paused", "completed"}
 
 class PipelineClient:
-    """Wrapper around ActivityWatchClient to handle pipeline-specific logic.
+    """Wrap ActivityWatchClient to handle pipeline-specific logic.
 
-    Privacy & Offline Policy:
-    - 100% Local Operation: No external network calls are made. All data stays local.
-    - Offline-First: Uses queued=True for all ActivityWatch interactions. Events are buffered
-      locally if the server is unavailable and flushed upon reconnection.
+    Manage the connection to the ActivityWatch server, ensuring robust handling
+    of network issues and strict adherence to privacy requirements. Provide
+    a simplified interface for sending pipeline stage events.
+
+    This client operates in a non-blocking manner by offloading network I/O and
+    serialization to a background worker thread. This ensures that the main
+    application loop is never blocked by ActivityWatch latency or connection timeouts.
+
+    Attributes:
+        watch_path (Path): The path being watched (used for context/logging).
+        port (Optional[int]): The port of the ActivityWatch server (default: 5600).
+        testing (bool): Whether to use a mock client for testing.
+        pulsetime (float): The heartbeat merge window in seconds (default: 120.0).
+        metadata_allowlist (Optional[Set[str]]): Set of allowed metadata keys.
+        hostname (str): The sanitized hostname used for bucket naming.
+        bucket_id (str): The unique bucket identifier (aw-watcher-pipeline-stage_{hostname}).
+        client (Any): The underlying ActivityWatchClient instance.
+        last_connection_error_log_time (float): Timestamp of the last connection error log.
     """
 
     __slots__ = (
@@ -99,6 +209,20 @@ class PipelineClient:
         client: Optional[Any] = None,
         metadata_allowlist: Optional[List[str]] = None,
     ) -> None:
+        """Initialize the PipelineClient.
+
+        Args:
+            watch_path (Path): The path to the file being watched.
+            port (Optional[int]): The ActivityWatch server port. Defaults to 5600 via aw-client.
+            testing (bool): If True, uses a mock client instead of connecting to a real server.
+            pulsetime (float): Time in seconds to merge consecutive heartbeats.
+            client (Optional[Any]): Injected client instance (for testing/dependency injection).
+            metadata_allowlist (Optional[List[str]]): List of allowed metadata keys to include in payloads.
+
+        Raises:
+            ValueError: If port is invalid or hostname cannot be determined.
+            ImportError: If aw-client is not installed and testing is False.
+        """
         self.watch_path = watch_path
         if port is not None:
             try:
@@ -117,7 +241,7 @@ class PipelineClient:
             if not self.hostname:
                 raise ValueError("Empty hostname")
         except Exception as e:
-            logger.warning("Failed to get hostname: %s. Using 'unknown-host'.", e)
+            logger.warning(f"Failed to get hostname: {e}. Using 'unknown-host'.")
             self.hostname = "unknown-host"
 
         # Sanitize hostname (keep alphanumeric, hyphens, underscores, dots)
@@ -148,8 +272,7 @@ class PipelineClient:
             self._home_path = None
 
         logger.info(
-            "PipelineClient initialized. Bucket: %s (Privacy: Local-only, Offline-first)",
-            self.bucket_id
+            f"PipelineClient initialized. Bucket: {self.bucket_id} (Privacy: Local-only, Offline-first)"
         )
 
         self.client: Any
@@ -164,15 +287,19 @@ class PipelineClient:
             try:
                 self.client = ActivityWatchClient("aw-watcher-pipeline-stage", port=port, testing=testing)
             except Exception as e:
-                logger.error("Failed to initialize ActivityWatchClient: %s", e)
+                logger.error(f"Failed to initialize ActivityWatchClient: {e}")
                 raise
 
     def wait_for_start(self, timeout: Optional[float] = None, stop_check: Optional[Callable[[], bool]] = None) -> None:
-        """Wait for ActivityWatch server to start.
+        """Wait for the ActivityWatch server to start.
 
         Args:
-            timeout: Maximum time to wait in seconds. If None, wait indefinitely.
-            stop_check: Optional callable returning True if waiting should be aborted (e.g. shutdown).
+            timeout (Optional[float]): Maximum time to wait in seconds. If None, wait indefinitely.
+            stop_check (Optional[Callable[[], bool]]): Optional callable returning True if waiting
+                should be aborted (e.g. shutdown).
+
+        Returns:
+            None
         """
         retry_delay = 1.0
         start_time = time.monotonic()
@@ -188,10 +315,10 @@ class PipelineClient:
             except Exception as e:
                 elapsed = time.monotonic() - start_time
                 if timeout is not None and elapsed >= timeout:
-                    logger.warning("Could not connect to ActivityWatch server after %ss. Proceeding in offline mode (queued).", timeout)
+                    logger.warning(f"Could not connect to ActivityWatch server after {timeout}s. Proceeding in offline mode (queued).")
                     break
 
-                logger.warning("Could not connect to ActivityWatch server: %s. Retrying in %ss...", e, retry_delay)
+                logger.warning(f"Could not connect to ActivityWatch server: {e}. Retrying in {retry_delay}s...")
                 
                 sleep_time = retry_delay
                 if timeout is not None:
@@ -211,10 +338,19 @@ class PipelineClient:
                 retry_delay = min(retry_delay * 2, 30.0)
 
     def ensure_bucket(self) -> None:
-        """Create the bucket if it doesn't exist.
+        """Create the bucket if it does not exist.
 
-        Uses queued=True to ensure bucket creation happens eventually even if
-        server is currently offline.
+        Uses `queued=True` to ensure bucket creation happens eventually even if
+        the server is currently offline. The bucket ID is constructed from the
+        sanitized hostname to ensure uniqueness.
+
+        Returns:
+            None
+
+        Raises:
+            Exception: If bucket creation fails immediately (e.g. client configuration error).
+                While connection errors are typically handled by the `queued=True` mechanism,
+                fatal errors from the underlying client (e.g. `ActivityWatchClientError`) will be re-raised.
         """
         try:
             self.client.create_bucket(
@@ -222,9 +358,9 @@ class PipelineClient:
                 event_type="current-pipeline-stage",
                 queued=True
             )
-            logger.info("Bucket '%s' ensured (queued).", self.bucket_id)
+            logger.info(f"Bucket '{self.bucket_id}' ensured (queued).")
         except Exception as e:
-            logger.error("Failed to create bucket: %s", e)
+            logger.error(f"Failed to create bucket: {e}")
             raise
 
     def send_heartbeat(
@@ -238,15 +374,61 @@ class PipelineClient:
         file_path: Optional[str] = None,
         computed_duration: Optional[float] = 0.0,
     ) -> None:
-        """Send a heartbeat to the server (Non-blocking).
+        """Send a heartbeat to the server (non-blocking).
 
         This method enqueues the heartbeat data to a background worker thread,
         ensuring the main thread is never blocked by network I/O or serialization.
 
-        Performance Notes:
-        - Execution Time: <0.2ms (Enqueues tuple only).
-        - Threading: Uses a dedicated daemon thread for processing.
-        - Optimization: Metadata is shallow-copied to ensure thread safety while minimizing overhead.
+        The worker thread constructs an ActivityWatch `Event` object with the provided
+        data and sends it to the configured bucket. The arguments provided here
+        are mapped to the `data` dictionary of the Event.
+
+        Note:
+            This method is non-blocking and does not raise exceptions to the caller.
+            Connection errors or serialization failures are logged by the worker thread.
+            Unlike the raw client, this wrapper suppresses `ActivityWatchClientError`
+            to prevent crashing the watcher loop, relying on offline queuing instead.
+
+        Args:
+            stage (str): The current pipeline stage name.
+            task (str): The current task description.
+            project_id (Optional[str]): Identifier for the project.
+            status (Optional[str]): Current status ('in_progress', 'paused', 'completed').
+            start_time (Optional[str]): ISO 8601 timestamp string for when the task started.
+            metadata (Optional[Dict[str, Any]]): Additional key-value metadata.
+                These keys are flattened into the event data. Keys may be filtered
+                if a metadata allowlist is configured. Metadata is truncated if it
+                exceeds 1KB to prevent payload bloat.
+            file_path (Optional[str]): Path to the file associated with the event.
+                Paths within the user's home directory are anonymized.
+            computed_duration (Optional[float]): Duration in seconds since the last update.
+
+        Returns:
+            None
+
+        Raises:
+            None: This method is non-blocking. Exceptions (including `ActivityWatchClientError`)
+                are caught and logged by the worker thread to prevent crashing the main application loop.
+
+        Example:
+            >>> client.send_heartbeat(
+            ...     stage="Build",
+            ...     task="Compiling",
+            ...     project_id="my-project",
+            ...     status="in_progress",
+            ...     metadata={"priority": "high"}
+            ... )
+            # Resulting Event payload (sent asynchronously):
+            # {
+            #     "timestamp": "...",
+            #     "data": {
+            #         "stage": "Build",
+            #         "task": "Compiling",
+            #         "project_id": "my-project",
+            #         "status": "in_progress",
+            #         "priority": "high"
+            #     }
+            # }
         """
         if self._closed:
             return
@@ -266,7 +448,11 @@ class PipelineClient:
         )
 
     def _worker_loop(self) -> None:
-        """Worker thread loop to process heartbeats from the queue."""
+        """Run the worker thread loop to process heartbeats from the queue.
+
+        Returns:
+            None
+        """
         while True:
             try:
                 item = self._queue.get()
@@ -275,7 +461,7 @@ class PipelineClient:
                 
                 self._send_heartbeat_sync(*item)
             except Exception as e:
-                logger.error("Error in heartbeat worker: %s", e, exc_info=True)
+                logger.error(f"Error in heartbeat worker: {e}", exc_info=True)
             finally:
                 self._queue.task_done()
 
@@ -291,29 +477,41 @@ class PipelineClient:
         computed_duration: Optional[float],
         current_time: datetime,
     ) -> None:
-        """Synchronous implementation of heartbeat sending (runs in worker thread).
+        """Send a heartbeat synchronously (runs in the worker thread).
 
-        Handles connection errors with local buffering (queued=True) and logging.
-        Catches all exceptions to prevent thread crashes.
+        Performs the following actions:
+        1. Validates input types (logging errors for invalid types).
+        2. Truncates strings that exceed length limits.
+        3. Sanitizes file paths (anonymizing home directory).
+        4. Flattens and filters metadata (enforcing size limits and allowlists).
+        5. Constructs the Event object.
+        6. Sends the heartbeat to ActivityWatch (with offline queuing).
 
-        Performance:
-        - Processing time: <10ms typical.
-        - Optimizations: Fast-path JSON serialization, pre-formatted dicts.
+        Args:
+            stage (str): The current pipeline stage name.
+            task (str): The current task description.
+            project_id (Optional[str]): Identifier for the project.
+            status (Optional[str]): Current status.
+            start_time (Optional[str]): ISO 8601 timestamp string.
+            metadata (Optional[Dict[str, Any]]): Additional metadata.
+            file_path (Optional[str]): Path to the file.
+            computed_duration (Optional[float]): Duration in seconds.
+            current_time (datetime): Timestamp captured when heartbeat was enqueued.
         """
         # Validation: Types (Fail fast)
         if not isinstance(stage, str):
-            logger.error("Invalid stage type: %s. Skipping heartbeat.", type(stage))
+            logger.error(f"Invalid stage type: {type(stage)}. Skipping heartbeat.")
             return
         if not isinstance(task, str):
-            logger.error("Invalid task type: %s. Skipping heartbeat.", type(task))
+            logger.error(f"Invalid task type: {type(task)}. Skipping heartbeat.")
             return
 
         # Truncation
         if len(stage) > 256:
-            logger.warning("Stage name too long (%d chars). Truncating to 256.", len(stage))
+            logger.warning(f"Stage name too long ({len(stage)} chars). Truncating to 256.")
             stage = stage[:256]
         if len(task) > 512:
-            logger.warning("Task name too long (%d chars). Truncating to 512.", len(task))
+            logger.warning(f"Task name too long ({len(task)} chars). Truncating to 512.")
             task = task[:512]
 
         # Status handling
@@ -322,7 +520,7 @@ class PipelineClient:
             if status in VALID_STATUSES:
                 final_status = status
             else:
-                logger.warning("Invalid status '%s'. Expected one of %s.", status, VALID_STATUSES)
+                logger.warning(f"Invalid status '{status}'. Expected one of {VALID_STATUSES}.")
 
         # Pre-format dict with core fields
         data: Dict[str, Any] = {
@@ -334,19 +532,19 @@ class PipelineClient:
         # Optional fields
         if project_id:
             if not isinstance(project_id, str):
-                logger.warning("Invalid project_id type: %s. Dropping.", type(project_id))
+                logger.warning(f"Invalid project_id type: {type(project_id)}. Dropping.")
             elif len(project_id) > 256:
-                logger.warning("project_id too long (%d). Truncating.", len(project_id))
+                logger.warning(f"project_id too long ({len(project_id)}). Truncating.")
                 data["project_id"] = project_id[:256]
             else:
                 data["project_id"] = project_id
 
         if file_path:
             if not isinstance(file_path, str):
-                logger.warning("Invalid file_path type: %s. Dropping.", type(file_path))
+                logger.warning(f"Invalid file_path type: {type(file_path)}. Dropping.")
             else:
                 if len(file_path) > 4096:
-                    logger.warning("file_path too long (%d). Truncating.", len(file_path))
+                    logger.warning(f"file_path too long ({len(file_path)}). Truncating.")
                     file_path = file_path[:4096]
 
                 # Privacy: Anonymize home directory
@@ -357,18 +555,18 @@ class PipelineClient:
 
         if computed_duration is not None:
             if not isinstance(computed_duration, (int, float)):
-                logger.warning("Invalid computed_duration type: %s. Dropping.", type(computed_duration))
+                logger.warning(f"Invalid computed_duration type: {type(computed_duration)}. Dropping.")
             elif computed_duration < 0:
-                logger.warning("Computed duration is negative (%ss).", computed_duration)
+                logger.warning(f"Computed duration is negative ({computed_duration}s).")
             elif computed_duration > 86400:
-                logger.warning("Computed duration is very large (%ss).", computed_duration)
+                logger.warning(f"Computed duration is very large ({computed_duration}s).")
             else:
                 data["computed_duration"] = computed_duration
 
         timestamp = current_time
         if start_time:
             if not isinstance(start_time, str):
-                logger.warning("Invalid start_time type: %s. Dropping.", type(start_time))
+                logger.warning(f"Invalid start_time type: {type(start_time)}. Dropping.")
             else:
                 try:
                     # Validate format and use as event timestamp
@@ -380,12 +578,12 @@ class PipelineClient:
                     timestamp = parsed_ts
                     data["start_time"] = start_time
                 except (ValueError, AttributeError, TypeError):
-                    logger.warning("Invalid start_time format: %s. Dropping.", start_time)
+                    logger.warning(f"Invalid start_time format: {start_time}. Dropping.")
 
         # Flatten metadata (Optimized)
         if metadata:
             if not isinstance(metadata, dict):
-                logger.warning("Metadata is not a dictionary (%s). Ignoring.", type(metadata).__name__)
+                logger.warning(f"Metadata is not a dictionary ({type(metadata).__name__}). Ignoring.")
             else:
                 # Security: Filter keys based on allowlist if configured
                 if self.metadata_allowlist is not None:
@@ -420,7 +618,7 @@ class PipelineClient:
                             safe_metadata[key_str] = v
                             current_size += item_size
                         except (TypeError, ValueError):
-                            logger.warning("Metadata value for key '%s' is not JSON serializable. Skipping.", k)
+                            logger.warning(f"Metadata value for key '{k}' is not JSON serializable. Skipping.")
                             continue
                     
                     # Merge the sanitized metadata. Core fields will overwrite metadata keys.
@@ -439,24 +637,26 @@ class PipelineClient:
                 queued=True  # Ensures non-blocking and offline buffering
             )
             if self.testing and isinstance(self.client, MockActivityWatchClient):
-                logger.info("[MOCK] heartbeat: %s - %s", stage, task)
+                logger.info(f"[MOCK] heartbeat: {stage} - {task}")
         except (TypeError, OverflowError, ValueError) as e:
             # These are fatal serialization errors for this event, do not retry.
-            logger.error("Failed to serialize heartbeat event (check metadata types): %s", e)
+            logger.error(f"Failed to serialize heartbeat event (check metadata types): {e}")
             # We return instead of re-raising, as the watcher's loop should not crash
             # on a single bad event.
             return
         except Exception as e:
             # All other exceptions from aw-client are considered unexpected,
-            # as queuing should prevent connection errors. Log and re-raise
-            # to be handled by the caller (e.g., the watcher's main loop).
-            logger.error("Failed to queue heartbeat: %s", e)
-            # Removed raise to prevent thread crash noise, as main loop cannot catch it from here.
+            # as queuing should prevent connection errors.
+            logger.error(f"Failed to send heartbeat: {e}", exc_info=True)
 
     def flush_queue(self) -> None:
         """Flush the event queue.
 
         This is useful for ensuring all queued events are sent before shutdown.
+        It delegates to the underlying client's flush method if available.
+
+        Returns:
+            None
         """
         try:
             if hasattr(self.client, "flush"):
@@ -468,10 +668,17 @@ class PipelineClient:
             else:
                 logger.warning("Client has no flush or disconnect method.")
         except Exception as e:
-            logger.error("Failed to flush event queue: %s", e)
+            logger.error(f"Failed to flush event queue: {e}")
 
     def close(self) -> None:
-        """Close the client connection."""
+        """Close the client connection and stop the worker thread.
+
+        Signals the worker thread to exit, waits for it to join, and closes
+        the underlying ActivityWatch client connection.
+
+        Returns:
+            None
+        """
         if self._closed:
             return
         self._closed = True
@@ -488,15 +695,39 @@ class PipelineClient:
                 self.client.disconnect()
                 logger.info("Client closed.")
         except Exception as e:
-            logger.error("Error closing client: %s", e)
+            logger.error(f"Error closing client: {e}")
 
     def __enter__(self) -> PipelineClient:
+        """Enter the context manager.
+
+        Establishes connection if the underlying client supports it.
+
+        Returns:
+            PipelineClient: The client instance.
+        """
         if hasattr(self.client, "connect"):
             self.client.connect()
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Exit the context manager.
+
+        Closes the client connection and stops the worker thread.
+
+        Args:
+            exc_type (Any): The exception type if an exception was raised, else None.
+            exc_value (Any): The exception value, else None.
+            traceback (Any): The traceback, else None.
+
+        Returns:
+            None
+        """
         self.close()
 
     def __repr__(self) -> str:
+        """Return a string representation of the client.
+
+        Returns:
+            str: String representation including bucket ID and hostname.
+        """
         return f"<PipelineClient bucket={self.bucket_id} host={self.hostname}>"

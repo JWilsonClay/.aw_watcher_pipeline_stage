@@ -84,7 +84,6 @@ def test_watcher_startup_capture(
     watcher = PipelineWatcher(
         populated_task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
 
@@ -138,7 +137,6 @@ def test_status_paused_completed_logic(populated_task_file: Path) -> None:
     watcher = PipelineWatcher(
         populated_task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
 
@@ -254,7 +252,6 @@ def test_periodic_heartbeats(populated_task_file: Path) -> None:
     watcher = PipelineWatcher(
         populated_task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
 
@@ -345,7 +342,6 @@ def test_modification_debounce_and_payload(
     watcher = PipelineWatcher(
         populated_task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=debounce_interval
     )
 
@@ -427,7 +423,6 @@ def test_creation_triggers_heartbeat(integration_temp_dir: Path) -> None:
     watcher = PipelineWatcher(
         task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
 
@@ -472,7 +467,6 @@ def test_irrelevant_change_skips_heartbeat(populated_task_file: Path) -> None:
     watcher = PipelineWatcher(
         populated_task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
 
@@ -537,7 +531,6 @@ def test_e2e_lifecycle(integration_temp_dir: Path) -> None:
     watcher = PipelineWatcher(
         task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.5
     )
     
@@ -653,7 +646,6 @@ def test_strict_interface_compliance(integration_temp_dir: Path) -> None:
         watcher = PipelineWatcher(
             task_file,
             client,
-            pulsetime=120.0,
             debounce_seconds=0.1
         )
         
@@ -724,7 +716,6 @@ def test_metadata_reordering_skips_heartbeat(populated_task_file: Path) -> None:
     watcher = PipelineWatcher(
         populated_task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
 
@@ -785,7 +776,6 @@ def test_full_flow_strict_timing(integration_temp_dir: Path) -> None:
     watcher = PipelineWatcher(
         task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=1.0
     )
     
@@ -875,7 +865,6 @@ def test_startup_flow_from_config(integration_temp_dir: Path) -> None:
     watcher = PipelineWatcher(
         config.watch_path,
         client,
-        pulsetime=config.pulsetime,
         debounce_seconds=config.debounce_seconds
     )
     
@@ -957,7 +946,6 @@ def test_metadata_allowlist_integration(integration_temp_dir: Path) -> None:
     watcher = PipelineWatcher(
         task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
     
@@ -1014,7 +1002,6 @@ def test_malformed_json_recovery_integration(integration_temp_dir: Path, caplog:
     watcher = PipelineWatcher(
         task_file,
         client,
-        pulsetime=120.0,
         debounce_seconds=0.1
     )
     
@@ -1093,7 +1080,6 @@ def test_core_integration_flow(integration_temp_dir: Path) -> None:
         watcher = PipelineWatcher(
             config.watch_path,
             client,
-            pulsetime=config.pulsetime,
             debounce_seconds=config.debounce_seconds
         )
         
@@ -1312,7 +1298,7 @@ def test_file_deletion_recovery_integration(integration_temp_dir: Path, caplog: 
     
     mock_aw_client = MockActivityWatchClient()
     client = PipelineClient(watch_path=task_file, client=mock_aw_client, testing=True)
-    watcher = PipelineWatcher(task_file, client, pulsetime=120.0, debounce_seconds=0.1)
+    watcher = PipelineWatcher(task_file, client, debounce_seconds=0.1)
     
     try:
         watcher.start()
@@ -1352,7 +1338,7 @@ def test_permission_recovery_integration(integration_temp_dir: Path, caplog: Log
     
     mock_aw_client = MockActivityWatchClient()
     client = PipelineClient(watch_path=task_file, client=mock_aw_client, testing=True)
-    watcher = PipelineWatcher(task_file, client, pulsetime=120.0, debounce_seconds=0.1)
+    watcher = PipelineWatcher(task_file, client, debounce_seconds=0.1)
     
     try:
         watcher.start()
@@ -1398,7 +1384,7 @@ def test_file_move_recovery_integration(integration_temp_dir: Path, caplog: LogC
     
     mock_aw_client = MockActivityWatchClient()
     client = PipelineClient(watch_path=task_file, client=mock_aw_client, testing=True)
-    watcher = PipelineWatcher(task_file, client, pulsetime=120.0, debounce_seconds=0.1)
+    watcher = PipelineWatcher(task_file, client, debounce_seconds=0.1)
     
     try:
         watcher.start()
@@ -1452,7 +1438,6 @@ def test_initial_presence_startup(integration_temp_dir: Path) -> None:
         watcher = PipelineWatcher(
             task_file,
             client,
-            pulsetime=120.0,
             debounce_seconds=0.1
         )
         
@@ -1569,7 +1554,8 @@ def test_system_main_args_propagation(integration_temp_dir: Path) -> None:
         "--debounce-seconds", "2.5",
         "--log-level", "DEBUG",
         "--log-file", str(log_file),
-        "--testing"
+        "--testing",
+        "--batch-size-limit", "10"
     ]
 
     class StartupSuccess(Exception):
@@ -1601,8 +1587,8 @@ def test_system_main_args_propagation(integration_temp_dir: Path) -> None:
         watcher_kwargs = MockWatcher.call_args[1]
         # args[0] is path
         assert str(watcher_args[0]) == str(task_file)
-        assert watcher_kwargs["pulsetime"] == 60.0
         assert watcher_kwargs["debounce_seconds"] == 2.5
+        assert watcher_kwargs["batch_size_limit"] == 10
 
         # Verify Logging setup
         MockSetupLogging.assert_called_once_with("DEBUG", str(log_file))
@@ -1761,3 +1747,279 @@ def test_system_main_argparse_namespace_handling(integration_temp_dir: Path) -> 
                     testing=True,
                     pulsetime=120.0
                 )
+
+
+def test_mixed_config_propagation_integration(integration_temp_dir: Path) -> None:
+    """
+    Test that configuration propagates correctly from mixed sources (Env + CLI)
+    through main() to the components (Client, Watcher).
+    """
+    task_file = integration_temp_dir / "mixed_config.json"
+    task_file.touch()
+    
+    # Env sets port (to be overridden), pulsetime (to be used), and batch_size_limit
+    env = {
+        "AW_WATCHER_PORT": "5611",
+        "AW_WATCHER_PULSETIME": "60.0",
+        "AW_WATCHER_METADATA_ALLOWLIST": "env_key",
+        "AW_WATCHER_BATCH_SIZE_LIMIT": "20",
+        "AW_WATCHER_DEBOUNCE_SECONDS": "0.1"
+    }
+    
+    # CLI sets watch_path, overrides port, sets testing, overrides metadata_allowlist
+    argv = [
+        "aw-watcher-pipeline-stage",
+        "--watch-path", str(task_file),
+        "--port", "5622",
+        "--testing",
+        "--metadata-allowlist", "cli_key1,cli_key2",
+        "--debounce-seconds", "2.5",
+        "--log-level", "DEBUG",
+        "--log-file", "test.log"
+    ]
+    
+    class StartupSuccess(Exception): pass
+
+    with patch.dict(os.environ, env, clear=True):
+        with patch("aw_watcher_pipeline_stage.main.PipelineWatcher") as MockWatcher, \
+             patch("aw_watcher_pipeline_stage.main.PipelineClient") as MockClient, \
+             patch("aw_watcher_pipeline_stage.main.setup_logging"), \
+             patch.object(sys, "argv", argv):
+            
+            # Stop main after init
+            MockWatcher.return_value.start.side_effect = StartupSuccess()
+            MockWatcher.return_value.observer.is_alive.return_value = True
+            MockWatcher.return_value.watch_dir.exists.return_value = True
+            
+            with pytest.raises(StartupSuccess):
+                from aw_watcher_pipeline_stage.main import main
+                main()
+                
+            # Verify Client init
+            MockClient.assert_called_once()
+            client_kwargs = MockClient.call_args[1]
+            
+            # CLI override (5622) should win over Env (5611)
+            assert client_kwargs["port"] == 5622
+            
+            # Env value (60.0) should be used as CLI didn't specify it
+            assert client_kwargs["pulsetime"] == 60.0
+            
+            # CLI flag
+            assert client_kwargs["testing"] is True
+            
+            # CLI override for metadata allowlist
+            assert client_kwargs["metadata_allowlist"] == ["cli_key1", "cli_key2"]
+            
+            # Verify Watcher init
+            MockWatcher.assert_called_once()
+            watcher_args = MockWatcher.call_args[0]
+            watcher_kwargs = MockWatcher.call_args[1]
+            assert str(watcher_args[0]) == str(task_file)
+            
+            # Env value for batch_size_limit should be used
+            assert watcher_kwargs["batch_size_limit"] == 20
+            
+            # CLI value for debounce (overrides Env)
+            assert watcher_kwargs["debounce_seconds"] == 2.5
+            
+            # Verify Logging setup
+            MockSetupLogging.assert_called_with("DEBUG", "test.log")
+
+
+def test_testing_flag_propagation_from_env(integration_temp_dir: Path) -> None:
+    """Test that testing mode is enabled via Env when CLI flag is absent."""
+    task_file = integration_temp_dir / "env_testing.json"
+    task_file.touch()
+    
+    env = {"AW_WATCHER_TESTING": "true"}
+    argv = ["aw-watcher-pipeline-stage", "--watch-path", str(task_file)]
+    
+    class StartupSuccess(Exception): pass
+
+    with patch.dict(os.environ, env, clear=True):
+        with patch("aw_watcher_pipeline_stage.main.PipelineWatcher") as MockWatcher, \
+             patch("aw_watcher_pipeline_stage.main.PipelineClient") as MockClient, \
+             patch("aw_watcher_pipeline_stage.main.setup_logging"), \
+             patch.object(sys, "argv", argv):
+            
+            MockWatcher.return_value.start.side_effect = StartupSuccess()
+            MockWatcher.return_value.observer.is_alive.return_value = True
+            MockWatcher.return_value.watch_dir.exists.return_value = True
+            
+            with pytest.raises(StartupSuccess):
+                from aw_watcher_pipeline_stage.main import main
+                main()
+            
+            # Verify Client init received testing=True
+            client_kwargs = MockClient.call_args[1]
+            assert client_kwargs["testing"] is True
+
+
+def test_batch_size_limit_trigger(integration_temp_dir: Path) -> None:
+    """Test that hitting batch_size_limit triggers immediate processing (bypassing long debounce)."""
+    task_file = integration_temp_dir / "batch_limit.json"
+    task_file.touch()
+
+    mock_aw_client = MockActivityWatchClient()
+    client = PipelineClient(
+        watch_path=task_file,
+        client=mock_aw_client,
+        testing=True
+    )
+
+    # Set long debounce (10s) but small batch limit (2)
+    watcher = PipelineWatcher(
+        task_file,
+        client,
+        debounce_seconds=10.0,
+        batch_size_limit=2
+    )
+
+    try:
+        watcher.start()
+        client.ensure_bucket()
+
+        # 1. First write
+        task_file.write_text(json.dumps({"current_stage": "1", "current_task": "1"}), encoding="utf-8")
+        time.sleep(0.1)
+        # Should be queued, not processed yet (debounce 10s)
+        assert len(mock_aw_client.events) == 0
+
+        # 2. Second write (Hits limit 2)
+        task_file.write_text(json.dumps({"current_stage": "2", "current_task": "2"}), encoding="utf-8")
+
+        # Wait short time (much less than 10s)
+        time.sleep(0.5)
+
+        # Should have triggered
+        assert len(mock_aw_client.events) >= 1
+        assert mock_aw_client.events[-1]["data"]["task"] == "2"
+
+    finally:
+        watcher.stop()
+
+
+def test_main_propagation_metadata_allowlist(integration_temp_dir: Path) -> None:
+    """Test that metadata_allowlist propagates from Env to Client via main()."""
+    task_file = integration_temp_dir / "metadata_prop.json"
+    task_file.touch()
+    
+    env = {
+        "AW_WATCHER_METADATA_ALLOWLIST": "allowed_key",
+        "AW_WATCHER_TESTING": "true"
+    }
+    
+    argv = ["aw-watcher-pipeline-stage", "--watch-path", str(task_file)]
+    
+    class StartupSuccess(Exception): pass
+
+    with patch.dict(os.environ, env, clear=True):
+        with patch("aw_watcher_pipeline_stage.main.PipelineWatcher") as MockWatcher, \
+             patch("aw_watcher_pipeline_stage.main.PipelineClient") as MockClient, \
+             patch("aw_watcher_pipeline_stage.main.setup_logging"), \
+             patch.object(sys, "argv", argv):
+            
+            MockWatcher.return_value.start.side_effect = StartupSuccess()
+            MockWatcher.return_value.observer.is_alive.return_value = True
+            MockWatcher.return_value.watch_dir.exists.return_value = True
+            
+            with pytest.raises(StartupSuccess):
+                from aw_watcher_pipeline_stage.main import main
+                main()
+            
+            # Verify Client init
+            MockClient.assert_called_once()
+            client_kwargs = MockClient.call_args[1]
+            assert client_kwargs["metadata_allowlist"] == ["allowed_key"]
+
+
+def test_main_propagation_port(integration_temp_dir: Path) -> None:
+    """Test that port propagates from CLI to Client via main()."""
+    task_file = integration_temp_dir / "port_prop.json"
+    task_file.touch()
+    
+    argv = ["aw-watcher-pipeline-stage", "--watch-path", str(task_file), "--port", "1234", "--testing"]
+    
+    class StartupSuccess(Exception): pass
+
+    with patch("aw_watcher_pipeline_stage.main.PipelineWatcher") as MockWatcher, \
+         patch("aw_watcher_pipeline_stage.main.PipelineClient") as MockClient, \
+         patch("aw_watcher_pipeline_stage.main.setup_logging"), \
+         patch.object(sys, "argv", argv):
+        
+        MockWatcher.return_value.start.side_effect = StartupSuccess()
+        MockWatcher.return_value.observer.is_alive.return_value = True
+        MockWatcher.return_value.watch_dir.exists.return_value = True
+        
+        with pytest.raises(StartupSuccess):
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        
+        # Verify Client init
+        MockClient.assert_called_once()
+        client_kwargs = MockClient.call_args[1]
+        assert client_kwargs["port"] == 1234
+
+
+def test_main_propagation_debounce(integration_temp_dir: Path) -> None:
+    """Test that debounce_seconds propagates from Config to Watcher via main()."""
+    task_file = integration_temp_dir / "debounce_prop.json"
+    task_file.touch()
+    
+    # Set via Env
+    env = {
+        "AW_WATCHER_DEBOUNCE_SECONDS": "2.5",
+        "AW_WATCHER_TESTING": "true"
+    }
+    
+    argv = ["aw-watcher-pipeline-stage", "--watch-path", str(task_file)]
+    
+    class StartupSuccess(Exception): pass
+
+    with patch.dict(os.environ, env, clear=True):
+        with patch("aw_watcher_pipeline_stage.main.PipelineWatcher") as MockWatcher, \
+             patch("aw_watcher_pipeline_stage.main.PipelineClient"), \
+             patch("aw_watcher_pipeline_stage.main.setup_logging"), \
+             patch.object(sys, "argv", argv):
+            
+            MockWatcher.return_value.start.side_effect = StartupSuccess()
+            MockWatcher.return_value.observer.is_alive.return_value = True
+            MockWatcher.return_value.watch_dir.exists.return_value = True
+            
+            with pytest.raises(StartupSuccess):
+                from aw_watcher_pipeline_stage.main import main
+                main()
+            
+            # Verify Watcher init
+            MockWatcher.assert_called_once()
+            watcher_kwargs = MockWatcher.call_args[1]
+            assert watcher_kwargs["debounce_seconds"] == 2.5
+
+
+def test_main_propagation_batch_size(integration_temp_dir: Path) -> None:
+    """Test that batch_size_limit propagates from CLI to Watcher via main()."""
+    task_file = integration_temp_dir / "batch_prop.json"
+    task_file.touch()
+    
+    argv = ["aw-watcher-pipeline-stage", "--watch-path", str(task_file), "--batch-size-limit", "50", "--testing"]
+    
+    class StartupSuccess(Exception): pass
+
+    with patch("aw_watcher_pipeline_stage.main.PipelineWatcher") as MockWatcher, \
+         patch("aw_watcher_pipeline_stage.main.PipelineClient"), \
+         patch("aw_watcher_pipeline_stage.main.setup_logging"), \
+         patch.object(sys, "argv", argv):
+        
+        MockWatcher.return_value.start.side_effect = StartupSuccess()
+        MockWatcher.return_value.observer.is_alive.return_value = True
+        MockWatcher.return_value.watch_dir.exists.return_value = True
+        
+        with pytest.raises(StartupSuccess):
+            from aw_watcher_pipeline_stage.main import main
+            main()
+        
+        # Verify Watcher init
+        MockWatcher.assert_called_once()
+        watcher_kwargs = MockWatcher.call_args[1]
+        assert watcher_kwargs["batch_size_limit"] == 50

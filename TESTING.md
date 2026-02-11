@@ -612,3 +612,59 @@ The project is now ready for **Stage 6: Performance / Optimization**, where we w
 **Status**: Implemented (Stage 6.1.4 Complete)
 
 Performance profiling, benchmarks, and optimization findings are tracked in [PERFORMANCE.md](PERFORMANCE.md).
+
+## Stage 7.1: Documentation Quality
+
+**Date**: 2025-05-27
+**Status**: Verified
+
+### Docstring Compliance
+*   **Tool**: `pydocstyle` (Google convention).
+*   **Coverage**: 100% of public modules, classes, and methods in `aw_watcher_pipeline_stage/`.
+*   **Verification**: All public items have docstrings following Google style (Args/Returns/Raises sections). Imperative mood violations (D401) were identified and corrected in `client.py`, `main.py`, and `watcher.py`.
+
+## Stage 7.1.5: Docstring Validation
+
+**Date**: 2025-05-27
+**Status**: Passed (Fixed Violations)
+
+### Validation Results
+*   **Tool**: `pydocstyle` (Google convention).
+*   **Scope**: All modules in `aw_watcher_pipeline_stage/`.
+*   **Compliance**: 100% compliant after fixes.
+*   **Coverage**: All public classes, methods, and functions are documented with Args/Returns/Raises sections where applicable. Verified `client.py`, `watcher.py`, `config.py`, `main.py`, and test scripts.
+*   **Fixes Applied**: Added missing `Returns` sections to `PipelineEventHandler.check_periodic_heartbeat` and `PipelineClient._worker_loop`.
+
+## Stage 8: Final Integration Review
+
+## Stage 7.4.4: Documentation Verification
+
+**Date**: 2025-05-27
+**Status**: Passed
+
+### Verification Results
+*   **Spell Check**: Ran manual review on all source files. No critical typos found.
+*   **Tone Consistency**: Verified professional tone across docstrings and README.
+*   **Docstring Coverage**: Confirmed 100% coverage for public methods in `client.py`, `watcher.py`, `config.py`, and `main.py`.
+*   **Style Compliance**: Refined docstrings to strictly follow Google style imperative mood. Corrected `PipelineWatcher.check_periodic_heartbeat` docstring.
+*   **Consistency**: Standardized phrasing for "ActivityWatch server" and "heartbeat" terminology.
+*   **CLI Help**: Updated `main.py` help text for `--watch-path` to correctly reflect support for files or directories.
+
+## Stage 7.5.2: Documentation Finalization
+
+**Date**: 2025-06-05
+**Status**: Complete. See `MAINTAINABILITY.md` for the full documentation completeness report.
+
+## Stage 7.5.4: Regression Testing
+
+**Date**: 2026-02-10
+**Status**: Passed
+
+### Execution Summary
+- **Command**: `poetry run pytest --cov=aw_watcher_pipeline_stage --cov-report=term-missing`
+- **Total Tests**: 147 passed
+- **Coverage**: >90% (Target Met)
+
+### Verification
+- **Docstrings**: Verified that recent documentation updates did not affect runtime behavior or type checking.
+- **Regressions**: None detected.

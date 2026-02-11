@@ -27,6 +27,7 @@ TEST_FILE = TEST_DIR / "current_task.json"
 
 
 def setup() -> None:
+    """Prepare the test environment."""
     if TEST_DIR.exists():
         shutil.rmtree(TEST_DIR)
     TEST_DIR.mkdir()
@@ -34,17 +35,24 @@ def setup() -> None:
 
 
 def cleanup() -> None:
+    """Clean up the test environment."""
     if TEST_DIR.exists():
         shutil.rmtree(TEST_DIR)
     logger.info("Cleaned up test directory.")
 
 
 def write_file(content: str) -> None:
+    """Write raw content to the test file.
+
+    Args:
+        content (str): The string content to write.
+    """
     with open(TEST_FILE, "w") as f:
         f.write(content)
 
 
 def main() -> None:
+    """Execute the edge case verification tests."""
     setup()
     
     logger.info(">>> STARTING EDGE CASE VERIFICATION <<<")

@@ -1,4 +1,18 @@
-"""Main entry point for aw-watcher-pipeline-stage."""
+"""Main entry point for aw-watcher-pipeline-stage.
+
+This module handles the command-line interface (CLI), configuration loading,
+logging setup, and the main event loop. It orchestrates the initialization
+of the PipelineClient and PipelineWatcher components.
+
+Key Responsibilities:
+    - CLI Argument Parsing: Handles --watch-path, --port, --testing, etc.
+    - Signal Handling: Registers handlers for SIGINT/SIGTERM to ensure graceful shutdown.
+    - Resource Management: Monitors CPU/Memory usage and logs anomalies.
+    - Logging: Configures structured logging with rotation (10MB) and privacy sanitization.
+    - Startup/Shutdown Invariants: Ensures graceful exit with resource cleanup
+      (flushing event queue, closing client) via atexit and finally blocks.
+    - Privacy: Logs a privacy notice on startup confirming local-only operation.
+"""
 
 from __future__ import annotations
 
@@ -10,9 +24,14 @@ import signal
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import FrameType
 from typing import Optional
+
+# Logging configuration constants
+LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(name)s: %(message)s'
+LOG_DATE_FORMAT = '%Y-%m-%dT%H:%M:%S'
 
 try:
     from aw_watcher_pipeline_stage.client import PipelineClient
@@ -31,6 +50,7 @@ except ImportError:
     resource = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # Global state for resource usage tracking
 _last_rusage = None
@@ -40,19 +60,41 @@ _last_info_log_time = 0.0
 def setup_logging(log_level: str, log_file: Optional[str]) -> None:
     """Configure the logging system.
 
+    Sets up console logging (stdout) and optional file logging with rotation.
+
+    Logging Practices:
+        - **Levels**:
+            - ``INFO``: Normal operations (state changes, startup).
+            - ``WARNING``: Recoverable issues (file not found, permission denied).
+            - ``ERROR``: Critical failures (unhandled exceptions, startup failure).
+            - ``DEBUG``: Detailed diagnostics (payloads, raw events).
+        - **Format**: ``[asctime] [levelname] name: message``
+        - **Output**: Console is always active. File logging is optional via ``--log-file``.
+        - **Rotation**: Log files are rotated at 10MB (keeping 5 backups) to prevent disk exhaustion.
+        - **Privacy**: Logs are sanitized to exclude sensitive data (e.g., file content snippets are only logged in DEBUG; paths in payloads are anonymized).
+
     Args:
-        log_level: The logging level (e.g., "INFO", "DEBUG").
-        log_file: Optional path to a log file.
+        log_level (str): The logging level (e.g., "DEBUG", "INFO", "WARNING", "ERROR").
+        log_file (Optional[str]): Optional path to a log file. If provided, logs are written here.
+
+    Returns:
+        None
 
     Raises:
-        ValueError: If the log level is invalid.
+        ValueError: If the provided log_level is not a valid logging level.
+
+    Example:
+        >>> setup_logging("INFO", "/path/to/watcher.log")
     """
     numeric_level = getattr(logging, log_level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"Invalid log level: {log_level}")
 
     handlers = []
-    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(name)s: %(message)s')
+    formatter = logging.Formatter(
+        LOG_FORMAT,
+        datefmt=LOG_DATE_FORMAT  # ISO 8601 format
+    )
 
     # Console handler (stdout)
     console_handler = logging.StreamHandler(sys.stdout)
@@ -61,7 +103,8 @@ def setup_logging(log_level: str, log_file: Optional[str]) -> None:
 
     if log_file:
         try:
-            file_handler = logging.FileHandler(log_file)
+            # Rotate at 10MB, keep 5 backups
+            file_handler = RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=5)
             file_handler.setFormatter(formatter)
             handlers.append(file_handler)
         except Exception as e:
@@ -72,7 +115,26 @@ def setup_logging(log_level: str, log_file: Optional[str]) -> None:
 
 
 def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
-    """Log resource usage if available."""
+    """Log current resource usage (CPU, Memory, Threads) and watcher statistics.
+
+    Monitors the process's resource consumption against defined targets (<1% CPU, <50MB RSS).
+    Logs warnings if anomalies are detected.
+    Updates global state (`_last_rusage`, `_last_rusage_time`) to track CPU usage over time intervals.
+
+    Note:
+        Resource usage monitoring requires the `resource` module (Unix-only).
+        On non-Unix systems, only thread count and watcher stats are logged.
+
+    Args:
+        watcher (Optional[PipelineWatcher]): PipelineWatcher instance to retrieve internal statistics
+            (e.g., event counts, latencies) for logging.
+
+    Returns:
+        None
+
+    Example:
+        >>> log_resource_usage(my_watcher_instance)
+    """
     global _last_rusage, _last_rusage_time, _last_info_log_time
 
     now = time.monotonic()
@@ -171,7 +233,8 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
     # Thresholds: RSS > 50MB, CPU > 10%, Threads > 10 (target is <1% idle, 10% is anomaly)
     try:
         thread_count = threading.active_count()
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Failed to get thread count: {e}")
         thread_count = -1
     is_anomaly = max_rss_mb > 50 or cpu_percent > 10.0 or thread_count > 10
     should_log_info = (now - _last_info_log_time) > 300.0  # Log INFO every 5 minutes
@@ -200,16 +263,40 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
 
 
 def main() -> None:
-    """Main execution function.
+    """Execute the main application logic.
 
-    Sets up logging, configuration, and the watcher loop.
-    Ensures graceful shutdown and error reporting to console.
+    Parse command-line arguments (from `sys.argv`) using `argparse`, load configuration, set up logging,
+    and start the watcher loop. Handle the lifecycle of the application,
+    including startup checks (bucket creation) and graceful shutdown on signals.
+    Ensure graceful exit with resource cleanup.
+
+    Command-line arguments handled:
+        --watch-path (str): Path to the directory or file to watch.
+        --port (int): Port of the ActivityWatch server (default: 5600).
+        --testing (bool): Run in testing mode (mock client).
+        --debug (bool): Enable debug logging (overrides --log-level).
+        --log-file (str): Path to the log file.
+        --log-level (str): Logging level (DEBUG, INFO, WARNING, ERROR). Default: INFO.
+        --pulsetime (float): Heartbeat merge window.
+        --debounce-seconds (float): Time in seconds to debounce file events.
+        --metadata-allowlist (str): Comma-separated list of allowed metadata keys.
+        --batch-size-limit (int): Max events to queue before forcing a batch process.
+
+    Returns:
+        None: The function returns None but may exit the process with a status code.
+
+    Raises:
+        SystemExit: If configuration is invalid (code 2), dependencies are missing, or
+            fatal errors occur during startup (code 1).
+
+    Example:
+        $ aw-watcher-pipeline-stage --watch-path ./my-project --log-level DEBUG
     """
     parser = argparse.ArgumentParser(
         description="ActivityWatch watcher for pipeline stages."
     )
     parser.add_argument(
-        "--watch-path", type=str, default=None, help="Path to the directory to watch."
+        "--watch-path", type=str, default=None, help="Path to the file or directory to watch."
     )
     parser.add_argument(
         "--port",
@@ -218,7 +305,7 @@ def main() -> None:
         help="Port of the ActivityWatch server (default: 5600).",
     )
     parser.add_argument(
-        "--testing", action="store_true", default=None, help="Run in testing mode."
+        "--testing", action="store_const", const=True, default=None, help="Run in testing mode."
     )
     parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging (overrides --log-level)."
@@ -238,15 +325,49 @@ def main() -> None:
         default=None,
         help="Time in seconds to wait before considering a task finished.",
     )
+    parser.add_argument(
+        "--debounce-seconds",
+        type=float,
+        default=None,
+        help="Time in seconds to debounce file events.",
+    )
+    parser.add_argument(
+        "--metadata-allowlist",
+        type=str,
+        default=None,
+        help="Comma-separated list of allowed metadata keys.",
+    )
+    parser.add_argument(
+        "--batch-size-limit",
+        type=int,
+        default=None,
+        help="Max events to queue before forcing a batch process (1-1000).",
+    )
 
     args = parser.parse_args()
 
-    # Load configuration
-    config = load_config(vars(args))
-    logger.debug(f"Configuration loaded: {config}")
+    # Bootstrap logging to capture config loading events
+    # Use the same format as the final setup for consistency
+    bootstrap_formatter = logging.Formatter(
+        LOG_FORMAT,
+        datefmt=LOG_DATE_FORMAT
+    )
+    bootstrap_handler = logging.StreamHandler(sys.stdout)
+    bootstrap_handler.setFormatter(bootstrap_formatter)
+    bootstrap_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=bootstrap_level, handlers=[bootstrap_handler], force=True)
 
-    # Setup logging
-    setup_logging(config.log_level, config.log_file)
+    try:
+        # Load configuration
+        config = load_config(vars(args))
+        logger.debug(f"Configuration loaded: {config}")
+
+        # Setup logging
+        setup_logging(config.log_level, config.log_file)
+    except ValueError as e:
+        sys.exit(f"Configuration Error: {e}")
+    except Exception as e:
+        sys.exit(f"Startup Error: {e}")
     logger.info(f"Starting aw-watcher-pipeline-stage v{__version__} (PID: {os.getpid()})...")
     logger.info("Privacy Notice: This watcher runs 100% locally and sends no telemetry.")
 
@@ -260,6 +381,18 @@ def main() -> None:
 
     # Define cleanup function
     def cleanup() -> None:
+        """Perform resource cleanup on exit.
+
+        Registered via `atexit` to ensure execution on normal interpreter termination.
+        Cancels timers, logs final resource usage, stops the watcher,
+        flushes the client queue, and closes the client connection.
+
+        This function suppresses and logs any exceptions that occur during cleanup
+        to ensure the process exits as cleanly as possible.
+
+        Returns:
+            None
+        """
         nonlocal resource_timer
         if resource_timer:
             resource_timer.cancel()
@@ -290,7 +423,17 @@ def main() -> None:
     stop_event = threading.Event()
 
     def signal_handler(sig: int, frame: Optional[FrameType]) -> None:
-        """Handle system signals for graceful shutdown."""
+        """Handle system signals (SIGINT, SIGTERM) for graceful shutdown.
+
+        Sets the stop event to trigger the main loop termination.
+
+        Args:
+            sig (int): The signal number.
+            frame (Optional[FrameType]): The current stack frame (unused).
+
+        Returns:
+            None
+        """
         sig_name = signal.Signals(sig).name
         logger.info(f"Received signal {sig_name}, shutting down...")
         stop_event.set()
@@ -305,6 +448,7 @@ def main() -> None:
             port=config.port,
             testing=config.testing,
             pulsetime=config.pulsetime,
+            metadata_allowlist=config.metadata_allowlist,
         )
 
         # Wait for server before starting watcher (with timeout for offline support)
@@ -322,8 +466,8 @@ def main() -> None:
         watcher = PipelineWatcher(
             watch_path,
             client,
-            pulsetime=config.pulsetime,
             debounce_seconds=config.debounce_seconds,
+            batch_size_limit=config.batch_size_limit,
         )
         
         # Robust startup: Wait for directory to exist AND start successfully
@@ -363,6 +507,16 @@ def main() -> None:
 
         # Resource usage logging timer
         def run_resource_log() -> None:
+            """Log resource usage periodically.
+
+            Run log_resource_usage() and reschedule itself if the
+            application is still running.
+
+            Catches and logs exceptions to prevent the timer thread from crashing.
+
+            Returns:
+                None
+            """
             nonlocal resource_timer
             if stop_event.is_set():
                 return
@@ -389,7 +543,7 @@ def main() -> None:
         logger.info("KeyboardInterrupt received, stopping...")
         pass
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.critical(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
     finally:
         cleanup()

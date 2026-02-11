@@ -31,6 +31,7 @@ TEST_FILE = TEST_DIR / "current_task.json"
 
 
 def setup() -> None:
+    """Prepare the test environment by creating the test directory."""
     if TEST_DIR.exists():
         shutil.rmtree(TEST_DIR)
     TEST_DIR.mkdir()
@@ -38,12 +39,18 @@ def setup() -> None:
 
 
 def cleanup() -> None:
+    """Clean up the test environment by removing the test directory."""
     if TEST_DIR.exists():
         shutil.rmtree(TEST_DIR)
     logger.info("Cleaned up test directory.")
 
 
 def write_json(data: Any) -> None:
+    """Write data to the test file.
+
+    Args:
+        data (Any): The data to write (dict or str).
+    """
     if isinstance(data, str):
         with open(TEST_FILE, "w") as f:
             f.write(data)
@@ -98,6 +105,7 @@ def run_stability_test() -> None:
         cleanup()
 
 def main() -> None:
+    """Execute the manual test scenarios."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--stability", action="store_true", help="Run stability test (30m)")
     args = parser.parse_args()

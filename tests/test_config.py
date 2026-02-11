@@ -27,6 +27,7 @@ def test_config_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
             assert config.pulsetime == 120.0
             assert config.debounce_seconds == 1.0
             assert config.testing is False
+            assert config.batch_size_limit == 5
 
 
 def test_git_root_detection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -473,11 +474,14 @@ def test_extra_config_keys_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 def test_invalid_type_conversion_raises() -> None:
     """Test that invalid types in config raise ValueError."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Invalid integer for port"):
         load_config({"port": "invalid_int"})
         
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Invalid float for pulsetime"):
         load_config({"pulsetime": "invalid_float"})
+
+    with pytest.raises(ValueError, match="Invalid integer for batch_size_limit"):
+        load_config({"batch_size_limit": "not_a_number"})
 
 
 def test_cli_args_none_values() -> None:
@@ -1203,10 +1207,10 @@ def test_config_file_is_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             mock_logger.error.assert_not_called()
 
 
-def test_log_level_case_preservation() -> None:
-    """Test that log_level case is preserved (main.py handles normalization)."""
+def test_log_level_normalization() -> None:
+    """Test that log_level is normalized to uppercase."""
     config = load_config({"log_level": "debug"})
-    assert config.log_level == "debug"
+    assert config.log_level == "DEBUG"
 
 
 def test_path_resolution_mixed_separators() -> None:
@@ -1463,6 +1467,14 @@ def test_invalid_numeric_values_logic() -> None:
     with pytest.raises(ValueError, match="debounce_seconds must be non-negative"):
         load_config({"debounce_seconds": -0.5})
 
+    # Invalid port range (Low)
+    with pytest.raises(ValueError, match="Port must be between 1 and 65535"):
+        load_config({"port": 0})
+
+    # Invalid port range (High)
+    with pytest.raises(ValueError, match="Port must be between 1 and 65535"):
+        load_config({"port": 65536})
+
 
 def test_path_traversal_resolution(tmp_path: Path) -> None:
     """Test that path traversal sequences are resolved and validated."""
@@ -1489,10 +1501,9 @@ def test_symlink_config_resolution(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("Symlinks not supported")
         
-    config = load_config({"watch_path": str(link)})
-    # Config should store the resolved path
-    assert config.watch_path == str(target.resolve())
-
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        load_config({"watch_path": str(link)})
+        
 
 def test_validate_path_symlink_loop(tmp_path: Path) -> None:
     """Test that a symlink loop in watch_path causes exit."""
@@ -1504,8 +1515,8 @@ def test_validate_path_symlink_loop(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("Symlinks not supported")
 
-    # load_config calls sys.exit(1) on validation failure
-    with pytest.raises(SystemExit):
+    # load_config raises ValueError on validation failure
+    with pytest.raises(ValueError):
         load_config({"watch_path": str(link1)})
 
 
@@ -1521,7 +1532,7 @@ def test_log_file_traversal_attack(tmp_path: Path) -> None:
     malicious_path = str(tmp_path / "subdir" / ".." / "system_file")
     
     # Should exit because we can't write to it (permission denied on open('a'))
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"log_file": malicious_path})
 
 
@@ -1542,7 +1553,7 @@ def test_watch_path_traversal_attack_explicit(tmp_path: Path) -> None:
 
     # Mock open to raise PermissionError to simulate protection
     with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": traversal_path})
 
 
@@ -1554,7 +1565,7 @@ def test_log_file_creation_failure_mock_oserror(tmp_path: Path) -> None:
     with patch("pathlib.Path.exists", return_value=False):
         with patch("pathlib.Path.open", side_effect=OSError("Disk full")):
             with patch("aw_watcher_pipeline_stage.config.logger") as mock_logger:
-                with pytest.raises(SystemExit):
+                with pytest.raises(ValueError):
                     load_config({"log_file": str(log_file)})
 
                 mock_logger.error.assert_called()
@@ -1565,7 +1576,7 @@ def test_validate_log_file_is_directory(tmp_path: Path) -> None:
     log_dir = tmp_path / "log_dir"
     log_dir.mkdir()
     
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"log_file": str(log_dir)})
 
 
@@ -1575,7 +1586,7 @@ def test_watch_path_is_directory_with_matching_name(tmp_path: Path) -> None:
     bad_dir = tmp_path / "fake_file.json"
     bad_dir.mkdir()
     
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"watch_path": str(bad_dir)})
 
     # Case 2: Watch path is dir, and contained current_task.json is ALSO a directory
@@ -1583,7 +1594,7 @@ def test_watch_path_is_directory_with_matching_name(tmp_path: Path) -> None:
     project_dir.mkdir()
     (project_dir / "current_task.json").mkdir()
     
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"watch_path": str(project_dir)})
 
 
@@ -1605,7 +1616,7 @@ def test_log_file_creation_failure_parent_permissions(tmp_path: Path) -> None:
 
     # Mock open to raise PermissionError (simulating read-only directory)
     with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"log_file": str(log_file)})
 
 
@@ -1614,7 +1625,7 @@ def test_watch_path_resolve_failure_loop(tmp_path: Path) -> None:
     # We can simulate this by mocking resolve to raise RuntimeError
     # Note: pathlib.Path.resolve raises RuntimeError for loops
     with patch("pathlib.Path.resolve", side_effect=RuntimeError("Symlink loop")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": "loop"})
 
 
@@ -1627,11 +1638,9 @@ def test_validate_path_broken_symlink_allowed(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("Symlinks not supported")
 
-    # Should not exit; config.py handles FileNotFoundError from resolve() by using parent
-    config = load_config({"watch_path": str(link)})
-    # Should return the absolute path to the link itself (since resolve failed)
-    assert Path(config.watch_path).name == "broken_link"
-    assert Path(config.watch_path).parent.resolve() == tmp_path.resolve()
+    # Should exit because symlinks are rejected
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        load_config({"watch_path": str(link)})
 
 
 def test_validate_path_directory_default_file_missing(tmp_path: Path) -> None:
@@ -1649,7 +1658,7 @@ def test_validate_path_directory_default_file_unreadable(tmp_path: Path) -> None
 
     # Mock open to raise PermissionError on the file
     with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(tmp_path)})
 
 
@@ -1669,7 +1678,7 @@ def test_validate_path_traversal_sensitive_access_denied(tmp_path: Path) -> None
     # Mock open to raise PermissionError, simulating lack of access
     # We rely on resolve() working correctly (tested elsewhere) and open() failing
     with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": traversal})
 
 
@@ -1705,7 +1714,7 @@ def test_log_file_oserror_on_creation(tmp_path: Path) -> None:
 
     # Mock open to raise OSError
     with patch("pathlib.Path.open", side_effect=OSError("Disk full")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"log_file": str(log_file)})
 
 
@@ -1795,7 +1804,7 @@ def test_log_file_is_special_file(tmp_path: Path) -> None:
 
     with patch("pathlib.Path.exists", autospec=True, side_effect=custom_exists):
         with patch("pathlib.Path.is_file", return_value=False):
-            with pytest.raises(SystemExit):
+            with pytest.raises(ValueError):
                 load_config({"log_file": str(special_file)})
 
 
@@ -1809,9 +1818,8 @@ def test_config_loading_with_broken_symlink_env(tmp_path: Path) -> None:
         pytest.skip("Symlinks not supported")
         
     with patch.dict(os.environ, {"PIPELINE_WATCHER_PATH": str(link)}, clear=True):
-        config = load_config({})
-        # Should resolve to the link path (since target is missing, it resolves parent / name)
-        assert config.watch_path == str(link.resolve())
+        with pytest.raises(ValueError, match="Symlinks are not allowed"):
+            load_config({})
 
 
 def test_log_file_creation_permission_error(tmp_path: Path) -> None:
@@ -1821,13 +1829,13 @@ def test_log_file_creation_permission_error(tmp_path: Path) -> None:
     
     # Mock open to raise PermissionError
     with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"log_file": str(log_file)})
 
 
 def test_validate_path_null_byte() -> None:
     """Test that paths with null bytes cause exit."""
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"watch_path": "/tmp/null\0byte"})
 
 
@@ -1840,7 +1848,7 @@ def test_priority_cli_invalid_path_exits(tmp_path: Path) -> None:
     invalid_cli = tmp_path / "missing_dir" / "file.json"
 
     with patch.dict(os.environ, {"PIPELINE_WATCHER_PATH": str(valid_env)}, clear=True):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(invalid_cli)})
 
 
@@ -1857,7 +1865,7 @@ def test_priority_env_invalid_path_exits(tmp_path: Path, monkeypatch: pytest.Mon
     invalid_env = tmp_path / "missing_dir" / "file.json"
 
     with patch.dict(os.environ, {"PIPELINE_WATCHER_PATH": str(invalid_env)}, clear=True):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({})
 
 def test_metadata_allowlist_priority_chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1871,7 +1879,7 @@ def test_metadata_allowlist_priority_chain(tmp_path: Path, monkeypatch: pytest.M
     env = {"AW_WATCHER_METADATA_ALLOWLIST": "env1, env2"}
     
     # 3. CLI
-    cli_args = {"metadata_allowlist": ["cli1", "cli2"]}
+    cli_args = {"metadata_allowlist": "cli1, cli2"}
     
     # Test CLI wins
     with patch.dict(os.environ, env, clear=True):
@@ -1898,7 +1906,7 @@ def test_validate_path_parent_is_not_directory(tmp_path: Path) -> None:
     # Try to use it as a directory
     bad_path = parent_file / "child.json"
     
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"watch_path": str(bad_path)})
 
 
@@ -1909,7 +1917,7 @@ def test_validate_log_file_parent_is_not_directory(tmp_path: Path) -> None:
     
     bad_log = parent_file / "child.log"
     
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"log_file": str(bad_log)})
 
 
@@ -1951,7 +1959,7 @@ def test_validate_log_file_creation_race_condition(tmp_path: Path) -> None:
     # Simulate exists() -> False, then open() -> OSError
     with patch("pathlib.Path.exists", return_value=False):
         with patch("pathlib.Path.open", side_effect=OSError("Directory not found")):
-            with pytest.raises(SystemExit):
+            with pytest.raises(ValueError):
                 load_config({"log_file": str(log_file)})
 
 
@@ -2062,6 +2070,45 @@ def test_config_priority_cli_overrides_env_all_fields(tmp_path: Path) -> None:
         assert config.debounce_seconds == 2.0
 
 
+def test_batch_size_limit_propagation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test batch_size_limit propagation: CLI > Env > Default."""
+    monkeypatch.chdir(tmp_path)
+    
+    # 1. Default
+    with patch.dict(os.environ, {}, clear=True):
+        config = load_config({})
+        assert config.batch_size_limit == 5
+
+    # 2. Config File
+    (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nbatch_size_limit = 8", encoding="utf-8")
+    with patch.dict(os.environ, {}, clear=True):
+        config = load_config({})
+        assert config.batch_size_limit == 8
+
+    # 3. Env
+    with patch.dict(os.environ, {"AW_WATCHER_BATCH_SIZE_LIMIT": "10"}, clear=True):
+        config = load_config({})
+        assert config.batch_size_limit == 10
+
+    # 4. CLI
+    with patch.dict(os.environ, {"AW_WATCHER_BATCH_SIZE_LIMIT": "10"}, clear=True):
+        config = load_config({"batch_size_limit": 20})
+        assert config.batch_size_limit == 20
+
+    # 5. Validation
+    with pytest.raises(ValueError, match="batch_size_limit must be between 1 and 1000"):
+        load_config({"batch_size_limit": 0})
+
+    with pytest.raises(ValueError, match="batch_size_limit must be between 1 and 1000"):
+        load_config({"batch_size_limit": 1001})
+
+
+def test_metadata_allowlist_empty_string() -> None:
+    """Test that empty string for metadata_allowlist results in empty list (allow nothing)."""
+    # Simulate CLI passing empty string
+    config = load_config({"metadata_allowlist": ""})
+    assert config.metadata_allowlist == []
+
 
 def test_validate_path_symlink_recursive_resolution(tmp_path: Path) -> None:
     """Test resolution of a chain of symlinks."""
@@ -2076,8 +2123,8 @@ def test_validate_path_symlink_recursive_resolution(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("Symlinks not supported")
         
-    config = load_config({"watch_path": str(link2)})
-    assert config.watch_path == str(target.resolve())
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        load_config({"watch_path": str(link2)})
 
 
 def test_validate_path_traversal_absolute_root(tmp_path: Path) -> None:
@@ -2088,7 +2135,7 @@ def test_validate_path_traversal_absolute_root(tmp_path: Path) -> None:
             with patch("pathlib.Path.is_file", return_value=True):
                 # Mock open to raise PermissionError (simulating protection)
                 with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-                    with pytest.raises(SystemExit):
+                    with pytest.raises(ValueError):
                         load_config({"watch_path": "/../etc/passwd"})
 
 
@@ -2100,7 +2147,7 @@ def test_validate_path_symlink_chain_to_sensitive(tmp_path: Path) -> None:
         with patch("pathlib.Path.exists", return_value=True):
             with patch("pathlib.Path.is_file", return_value=True):
                 with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-                    with pytest.raises(SystemExit):
+                    with pytest.raises(ValueError):
                         load_config({"watch_path": str(link)})
 
 
@@ -2182,7 +2229,7 @@ def test_validate_path_symlink_to_file_permission_denied_mock(tmp_path: Path) ->
 
     # Mock open to raise PermissionError
     with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(link)})
 
 
@@ -2197,7 +2244,7 @@ def test_security_real_fifo_rejection(tmp_path: Path) -> None:
     except AttributeError:
         pytest.skip("os.mkfifo not available")
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"watch_path": str(fifo_path)})
 
 
@@ -2211,7 +2258,7 @@ def test_security_real_permission_denied(tmp_path: Path) -> None:
     f.chmod(0o000)  # No permissions
 
     try:
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(f)})
     finally:
         f.chmod(0o666)  # Restore for cleanup
@@ -2221,6 +2268,12 @@ def test_metadata_allowlist_parsing_edge_cases() -> None:
     """Test parsing of metadata allowlist with empty items and whitespace."""
     config = load_config({"metadata_allowlist": " a , , b "})
     assert config.metadata_allowlist == ["a", "b"]
+
+
+def test_metadata_allowlist_list_input_stripping() -> None:
+    """Test that list input for metadata_allowlist is stripped of whitespace."""
+    config = load_config({"metadata_allowlist": [" a ", "b ", " c"]})
+    assert config.metadata_allowlist == ["a", "b", "c"]
 
 
 def test_config_file_invalid_boolean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2237,7 +2290,7 @@ def test_validate_log_file_parent_not_found(tmp_path: Path) -> None:
     """Test that log file validation fails if parent directory does not exist."""
     log_file = tmp_path / "nonexistent_dir" / "test.log"
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError):
         load_config({"log_file": str(log_file)})
 
 
@@ -2283,7 +2336,7 @@ def test_validate_path_long_path_error(tmp_path: Path) -> None:
     long_path = "a" * 1000
     
     with patch("pathlib.Path.resolve", side_effect=OSError("File name too long")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": long_path})
 
 
@@ -2291,7 +2344,7 @@ def test_validate_path_parent_permission_denied_during_recovery(tmp_path: Path) 
     """Test handling of PermissionError when resolving parent of a non-existent path."""
     # Simulate path not found (first resolve), then parent resolution fails (second resolve)
     with patch("pathlib.Path.resolve", side_effect=[FileNotFoundError, PermissionError("Access denied")]):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": "/restricted/missing.json"})
 
 
@@ -2301,7 +2354,7 @@ def test_config_file_invalid_watch_path_parent_missing(tmp_path: Path, monkeypat
     (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nwatch_path = /nonexistent/dir/file.json", encoding="utf-8")
     
     with patch.dict(os.environ, {}, clear=True):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({})
 
 
@@ -2317,7 +2370,7 @@ def test_config_file_log_file_permission_denied(tmp_path: Path, monkeypatch: pyt
         # Mock open to raise PermissionError. Since watch_path defaults to non-existent file in tmp_path,
         # it won't trigger open(), so only log_file open() will fail.
         with patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-            with pytest.raises(SystemExit):
+            with pytest.raises(ValueError):
                 load_config({})
 
 
@@ -2354,7 +2407,7 @@ def test_config_file_path_traversal_attack(tmp_path: Path, monkeypatch: pytest.M
     (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nwatch_path = ../nonexistent/file.json", encoding="utf-8")
     
     with patch.dict(os.environ, {}, clear=True):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({})
 
 
@@ -2392,8 +2445,8 @@ def test_validate_path_directory_symlink_default_file(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("Symlinks not supported")
         
-    config = load_config({"watch_path": str(link_dir)})
-    assert Path(config.watch_path).resolve() == target.resolve()
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        load_config({"watch_path": str(link_dir)})
 
 
 def test_validate_path_parent_not_executable(tmp_path: Path) -> None:
@@ -2402,7 +2455,7 @@ def test_validate_path_parent_not_executable(tmp_path: Path) -> None:
     
     # Mock resolve to raise PermissionError (simulating traversal denial)
     with patch("pathlib.Path.resolve", side_effect=PermissionError("Permission denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(target)})
 
 
@@ -2433,8 +2486,8 @@ def test_validate_path_relative_symlink_resolution(tmp_path: Path, monkeypatch: 
     except OSError:
         pytest.skip("Symlinks not supported")
         
-    config = load_config({"watch_path": str(link)})
-    assert Path(config.watch_path).resolve() == real_file.resolve()
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        load_config({"watch_path": str(link)})
 
 
 @pytest.mark.parametrize("method_name, exception", [
@@ -2451,7 +2504,7 @@ def test_validate_path_permission_errors_parametrized(tmp_path: Path, method_nam
         f.touch()
     
     with patch(method_name, side_effect=exception):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(f)})
 
 
@@ -2466,7 +2519,7 @@ def test_validate_path_rejects_non_regular_files_parametrized(tmp_path: Path, is
          patch("pathlib.Path.exists", return_value=exists_val), \
          patch("pathlib.Path.is_file", return_value=is_file_val), \
          patch("pathlib.Path.is_dir", return_value=is_dir_val):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(p)})
 
 
@@ -2484,5 +2537,191 @@ def test_validate_path_rejects_protected_targets_parametrized(tmp_path: Path, ta
          patch("pathlib.Path.exists", return_value=True), \
          patch("pathlib.Path.is_file", return_value=True), \
          patch("pathlib.Path.open", side_effect=PermissionError("Access denied")):
-        with pytest.raises(SystemExit):
+        with pytest.raises(ValueError):
             load_config({"watch_path": str(link)})
+
+
+def test_invalid_log_level_raises() -> None:
+    """Test that invalid log level raises ValueError."""
+    with pytest.raises(ValueError, match="Invalid log level"):
+        load_config({"log_level": "INVALID_LEVEL"})
+
+
+def test_config_priority_full_chain_all_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Verify config flow: CLI > Env > Config File > Defaults for ALL fields.
+    """
+    monkeypatch.chdir(tmp_path)
+    
+    # 1. Config File (Lowest priority of sources)
+    (tmp_path / "config.ini").write_text("""
+[aw-watcher-pipeline-stage]
+watch_path = ./file_config.json
+port = 5001
+testing = false
+pulsetime = 60.0
+debounce_seconds = 2.0
+metadata_allowlist = config1, config2
+log_level = WARNING
+log_file = config.log
+batch_size_limit = 3
+""", encoding="utf-8")
+
+    # 2. Env (Middle priority)
+    env = {
+        "PIPELINE_WATCHER_PATH": "./file_env.json",
+        "AW_WATCHER_PORT": "5002",
+        "AW_WATCHER_TESTING": "true",
+        "AW_WATCHER_PULSETIME": "120.0",
+        "AW_WATCHER_DEBOUNCE_SECONDS": "1.0",
+        "AW_WATCHER_METADATA_ALLOWLIST": "env1, env2",
+        "AW_WATCHER_LOG_LEVEL": "ERROR",
+        "AW_WATCHER_LOG_FILE": "env.log",
+        "AW_WATCHER_BATCH_SIZE_LIMIT": "7"
+    }
+
+    # 3. CLI (Highest priority)
+    cli_args = {
+        "watch_path": "./file_cli.json",
+        "port": 5003,
+        "testing": False,
+        "pulsetime": 180.0,
+        "debounce_seconds": 0.5,
+        "metadata_allowlist": "cli1, cli2",
+        "log_level": "DEBUG",
+        "log_file": "cli.log",
+        "batch_size_limit": 9
+    }
+
+    # Test A: Config File Only (Env empty, CLI empty)
+    with patch.dict(os.environ, {}, clear=True):
+        config = load_config({})
+        assert config.watch_path == "./file_config.json"
+        assert config.port == 5001
+        assert config.testing is False
+        assert config.pulsetime == 60.0
+        assert config.debounce_seconds == 2.0
+        assert config.metadata_allowlist == ["config1", "config2"]
+        assert config.log_level == "WARNING"
+        assert config.log_file == "config.log"
+        assert config.batch_size_limit == 3
+
+    # Test B: Env Overrides Config
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config({})
+        assert config.watch_path == "./file_env.json"
+        assert config.port == 5002
+        assert config.testing is True
+        assert config.pulsetime == 120.0
+        assert config.debounce_seconds == 1.0
+        assert config.metadata_allowlist == ["env1", "env2"]
+        assert config.log_level == "ERROR"
+        assert config.log_file == "env.log"
+        assert config.batch_size_limit == 7
+
+    # Test C: CLI Overrides Env
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config(cli_args)
+        assert config.watch_path == "./file_cli.json"
+        assert config.port == 5003
+        assert config.testing is False
+        assert config.pulsetime == 180.0
+        assert config.debounce_seconds == 0.5
+        assert config.metadata_allowlist == ["cli1", "cli2"]
+        assert config.log_level == "DEBUG"
+        assert config.log_file == "cli.log"
+        assert config.batch_size_limit == 9
+
+
+def test_config_file_batch_size_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that batch_size_limit is correctly loaded and validated from config file."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nbatch_size_limit = 50", encoding="utf-8")
+
+    with patch.dict(os.environ, {}, clear=True):
+        config = load_config({})
+        assert config.batch_size_limit == 50
+
+    # Test invalid value in config file
+    (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nbatch_size_limit = -5", encoding="utf-8")
+    with patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(ValueError, match="batch_size_limit must be between 1 and 1000"):
+            load_config({})
+
+
+def test_full_mixed_source_propagation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Verify that configuration propagates correctly from mixed sources for ALL fields.
+    Scenario:
+    - Config File: watch_path, port
+    - Env: testing, pulsetime, log_level
+    - CLI: debounce_seconds, metadata_allowlist, batch_size_limit, log_file
+    """
+    monkeypatch.chdir(tmp_path)
+    
+    # 1. Config File
+    (tmp_path / "config.ini").write_text("""
+[aw-watcher-pipeline-stage]
+watch_path = ./file_watch.json
+port = 5001
+testing = true
+""", encoding="utf-8")
+
+    # 2. Env
+    env = {
+        "AW_WATCHER_TESTING": "false", # Should override config file
+        "AW_WATCHER_PULSETIME": "60.0",
+        "AW_WATCHER_LOG_LEVEL": "WARNING"
+    }
+
+    # 3. CLI
+    cli_args = {
+        "debounce_seconds": 2.5,
+        "metadata_allowlist": "tag1, tag2",
+        "batch_size_limit": 10,
+        "log_file": "cli.log"
+    }
+
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config(cli_args)
+
+        # Check Config File values (not overridden by Env/CLI)
+        assert config.watch_path == "./file_watch.json"
+        assert config.port == 5001
+
+        # Check Env values (override Config File)
+        assert config.testing is False # Env "false" overrides Config "true"
+        assert config.pulsetime == 60.0
+        assert config.log_level == "WARNING"
+
+        # Check CLI values (override everything else)
+        assert config.debounce_seconds == 2.5
+        assert config.metadata_allowlist == ["tag1", "tag2"]
+        assert config.batch_size_limit == 10
+        assert config.log_file == "cli.log"
+
+
+def test_config_priority_cli_disable_log_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that passing empty string for log_file via CLI disables it (overriding config)."""
+    monkeypatch.chdir(tmp_path)
+    
+    # Config file enables logging
+    (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nlog_file = config.log", encoding="utf-8")
+    
+    # CLI passes empty string to disable
+    cli_args = {"log_file": ""}
+    
+    with patch.dict(os.environ, {}, clear=True):
+        config = load_config(cli_args)
+        # Should be empty string (falsy), which setup_logging treats as "no file"
+        assert config.log_file == ""
+
+
+def test_metadata_allowlist_mixed_source_parsing(tmp_path: Path) -> None:
+    """Test metadata_allowlist parsing when overriding via different sources."""
+    # Env has spaces
+    env = {"AW_WATCHER_METADATA_ALLOWLIST": "  env1 , env2  "}
+    
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config({})
+        assert config.metadata_allowlist == ["env1", "env2"]
