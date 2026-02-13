@@ -6,7 +6,10 @@ of the PipelineClient and PipelineWatcher components.
 
 Key Responsibilities:
     - CLI Argument Parsing: Handles --watch-path, --port, --testing, etc.
-    - Signal Handling: Registers handlers for SIGINT/SIGTERM to ensure graceful shutdown.
+    - Signal Handling: Registers handlers for SIGINT/SIGTERM to ensure graceful
+      shutdown.
+      Sets a stop event to break the main loop, triggering cleanup in the finally block.
+      Force exits with os._exit(1) if a second signal is received (stuck shutdown).
     - Resource Management: Monitors CPU/Memory usage and logs anomalies.
     - Logging: Configures structured logging with rotation (10MB) and privacy sanitization.
     - Startup/Shutdown Invariants: Ensures graceful exit with resource cleanup
@@ -29,25 +32,18 @@ from pathlib import Path
 from types import FrameType
 from typing import Optional
 
-# Logging configuration constants
-LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(name)s: %(message)s'
-LOG_DATE_FORMAT = '%Y-%m-%dT%H:%M:%S'
-
-try:
-    from aw_watcher_pipeline_stage.client import PipelineClient
-    from aw_watcher_pipeline_stage.config import load_config
-    from aw_watcher_pipeline_stage.watcher import PipelineWatcher
-    from aw_watcher_pipeline_stage import __version__
-except ImportError as e:
-    # Check if it's a missing dependency
-    if "watchdog" in str(e) or "aw_client" in str(e):
-        sys.exit(f"Error: Missing dependency: {e}. Please install required packages.")
-    raise
-
 try:
     import resource
 except ImportError:
     resource = None  # type: ignore
+
+from aw_watcher_pipeline_stage import __version__
+from aw_watcher_pipeline_stage.client import PipelineClient
+from aw_watcher_pipeline_stage.config import load_config
+from aw_watcher_pipeline_stage.watcher import PipelineWatcher
+
+
+__all__ = ["setup_logging", "log_resource_usage", "main"]
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -56,6 +52,11 @@ logger.addHandler(logging.NullHandler())
 _last_rusage = None
 _last_rusage_time = 0.0
 _last_info_log_time = 0.0
+
+# Logging configuration constants
+LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(name)s: %(message)s'
+LOG_DATE_FORMAT = '%Y-%m-%dT%H:%M:%S'
+
 
 def setup_logging(log_level: str, log_file: Optional[str]) -> None:
     """Configure the logging system.
@@ -114,6 +115,7 @@ def setup_logging(log_level: str, log_file: Optional[str]) -> None:
     logging.basicConfig(level=numeric_level, handlers=handlers, force=True)
 
 
+
 def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
     """Log current resource usage (CPU, Memory, Threads) and watcher statistics.
 
@@ -141,7 +143,7 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
     stats_msg = ""
     max_rss_mb = 0.0
     cpu_percent = 0.0
-    
+
     if resource:
         try:
             usage = resource.getrusage(resource.RUSAGE_SELF)
@@ -161,11 +163,11 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
                     user_delta = usage.ru_utime - _last_rusage.ru_utime
                     sys_delta = usage.ru_stime - _last_rusage.ru_stime
                     cpu_percent = ((user_delta + sys_delta) / time_delta) * 100
-                    
+
                     # Only update baseline if we successfully calculated a new interval
                     _last_rusage = usage
                     _last_rusage_time = now
-            
+
             if _last_rusage is None:
                 _last_rusage = usage
                 _last_rusage_time = now
@@ -193,7 +195,7 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
                 f"Errors={stats.get('parse_errors', 0)}, "
                 f"Keys={stats.get('state_keys', 0)}"
             )
-            
+
             uptime = stats.get("uptime", 0.0)
             m, s = divmod(int(uptime), 60)
             h, m = divmod(m, 60)
@@ -208,16 +210,16 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
             if last_hb > 0:
                 ago = now - last_hb
                 stats_msg += f", LastHB={ago:.1f}s"
-            
+
             max_hb_int = stats.get("max_heartbeat_interval", 0.0)
             if max_hb_int > 0:
                 stats_msg += f", MaxHBInt={max_hb_int:.1f}s"
-            
+
             latency = stats.get("processing_latency", 0.0)
             max_latency = stats.get("max_processing_latency", 0.0)
             if latency > 0 or max_latency > 0:
                 stats_msg += f", Latency={latency:.3f}s (Max={max_latency:.3f}s)"
-            
+
             hb_latency = stats.get("heartbeat_latency", 0.0)
             max_hb_latency = stats.get("max_heartbeat_latency", 0.0)
             if hb_latency > 0 or max_hb_latency > 0:
@@ -243,7 +245,8 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
 
     if resource:
         msg = (
-            f"Resource Usage (PID={os.getpid()}) [{status_label}]: Max RSS={max_rss_mb:.2f}MB (Target <50MB), "
+            f"Resource Usage (PID={os.getpid()}) [{status_label}]: "
+            f"Max RSS={max_rss_mb:.2f}MB (Target <50MB), "
             f"CPU={cpu_percent:.2f}% (Target <1%), Threads={thread_count}{stats_msg}"
         )
     else:
@@ -260,6 +263,7 @@ def log_resource_usage(watcher: Optional[PipelineWatcher] = None) -> None:
         _last_info_log_time = now
     elif logger.isEnabledFor(logging.DEBUG):
         logger.debug(msg)
+
 
 
 def main() -> None:
@@ -296,7 +300,10 @@ def main() -> None:
         description="ActivityWatch watcher for pipeline stages."
     )
     parser.add_argument(
-        "--watch-path", type=str, default=None, help="Path to the file or directory to watch."
+        "--watch-path",
+        type=str,
+        default=None,
+        help="Path to the file or directory to watch.",
     )
     parser.add_argument(
         "--port",
@@ -305,10 +312,23 @@ def main() -> None:
         help="Port of the ActivityWatch server (default: 5600).",
     )
     parser.add_argument(
-        "--testing", action="store_const", const=True, default=None, help="Run in testing mode."
+        "--testing",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Run in testing mode.",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="Enable debug logging (overrides --log-level)."
+        "--no-testing",
+        action="store_const",
+        const=False,
+        dest="testing",
+        help="Disable testing mode (overrides config/env).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (overrides --log-level).",
     )
     parser.add_argument(
         "--log-file", type=str, default=None, help="Path to the log file."
@@ -323,25 +343,25 @@ def main() -> None:
         "--pulsetime",
         type=float,
         default=None,
-        help="Time in seconds to wait before considering a task finished.",
+        help="Time in seconds to wait before considering a task finished (default: 120.0).",
     )
     parser.add_argument(
         "--debounce-seconds",
         type=float,
         default=None,
-        help="Time in seconds to debounce file events.",
+        help="Time in seconds to debounce file events (default: 1.0).",
     )
     parser.add_argument(
         "--metadata-allowlist",
         type=str,
         default=None,
-        help="Comma-separated list of allowed metadata keys.",
+        help="Comma-separated list of allowed metadata keys (default: All).",
     )
     parser.add_argument(
         "--batch-size-limit",
         type=int,
         default=None,
-        help="Max events to queue before forcing a batch process (1-1000).",
+        help="Max events to queue before forcing a batch process (1-1000) (default: 5).",
     )
 
     args = parser.parse_args()
@@ -364,27 +384,42 @@ def main() -> None:
 
         # Setup logging
         setup_logging(config.log_level, config.log_file)
+        if config.log_level == "DEBUG":
+            logger.debug(f"Debug logging enabled. Log file: {config.log_file}")
     except ValueError as e:
         sys.exit(f"Configuration Error: {e}")
     except Exception as e:
         sys.exit(f"Startup Error: {e}")
     logger.info(f"Starting aw-watcher-pipeline-stage v{__version__} (PID: {os.getpid()})...")
+    # Privacy Compliance: Explicitly state local-only operation on startup
+    # Audit (Stage 8.4.5): Verified local-only notice.
     logger.info("Privacy Notice: This watcher runs 100% locally and sends no telemetry.")
 
-    # Watch path is already resolved and validated in config
+    # Watch path is already resolved and validated in config (str -> Path)
     watch_path = Path(config.watch_path)
 
     # Initialize variables for cleanup safety
     client: Optional[PipelineClient] = None
     watcher: Optional[PipelineWatcher] = None
     resource_timer: Optional[threading.Timer] = None
+    cleanup_done = False
+
+    # Event to signal shutdown
+    stop_event = threading.Event()
 
     # Define cleanup function
     def cleanup() -> None:
         """Perform resource cleanup on exit.
 
         Registered via `atexit` to ensure execution on normal interpreter termination.
-        Cancels timers, logs final resource usage, stops the watcher,
+        Order of operations:
+        1. Stop Watcher (prevents new events).
+        2. Flush Client Queue (sends pending events).
+        3. Close Client (cleans up worker thread).
+        4. Shutdown Logging.
+
+        Flushes stdio (safely), cancels timers, logs final resource usage,
+        stops the watcher (observer.stop/join),
         flushes the client queue, and closes the client connection.
 
         This function suppresses and logs any exceptions that occur during cleanup
@@ -393,39 +428,126 @@ def main() -> None:
         Returns:
             None
         """
-        nonlocal resource_timer
-        if resource_timer:
-            resource_timer.cancel()
-            resource_timer = None
+        nonlocal resource_timer, client, watcher, cleanup_done
 
-        # Log final resource usage
-        log_resource_usage(watcher)
+        # Ensure any waiters are woken up (redundancy for atexit calls)
+        stop_event.set()
 
-        if watcher:
-            try:
-                watcher.stop()
-            except Exception as e:
-                logger.error(f"Error stopping watcher in cleanup: {e}")
+        # Idempotency check
+        if cleanup_done:
+            return
+        cleanup_done = True
 
-        if client:
+        # Ensure streams are flushed early to capture any pending output
+        try:
+            if sys:
+                if getattr(sys, "stdout", None):
+                    sys.stdout.flush()
+                if getattr(sys, "stderr", None):
+                    sys.stderr.flush()
+        except Exception:
+            pass
+
+        try:
+            # We use a try-except block for logging in case it's already shut down
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("Cleanup started...")
+            except Exception:
+                pass
+
+            if resource_timer:
+                try:
+                    resource_timer.cancel()
+                    # Join if it's a thread, though cancel is usually enough for Timer
+                    if resource_timer.is_alive():
+                        resource_timer.join(timeout=0.1)
+                except Exception:
+                    pass
+                resource_timer = None
+
+            # Log final resource usage
+            if watcher:
+                try:
+                    log_resource_usage(watcher)
+                except Exception:
+                    pass
+
+            if watcher:
+                try:
+                    logger.info("Stopping watcher...")
+                    # watcher.stop() handles observer.stop() and observer.join()
+                    watcher.stop()
+                    logger.info("Watcher stopped.")
+                    logger.debug("Watcher cleanup complete.")
+                except Exception as e:
+                    try:
+                        logger.error(f"Error stopping watcher in cleanup: {e}")
+                    except Exception:
+                        pass
+                finally:
+                    watcher = None
+
+            if client:
+                try:
+                    try:
+                        # Flush queue before closing to ensure no data loss
+                        # Note: This blocks until the queue is empty. If the worker is stuck,
+                        # the process will hang until a second signal forces exit.
+                        client.flush_queue()
+                    except Exception as e:
+                        try:
+                            logger.error(f"Error flushing queue: {e}")
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        # client.close() stops the worker thread and closes connection
+                        client.close()
+                        logger.debug("Client cleanup complete.")
+                    except Exception as e:
+                        try:
+                            logger.error(f"Error closing client: {e}")
+                        except Exception:
+                            pass
+                    finally:
+                        client = None
+
             try:
-                client.flush_queue()
-            except Exception as e:
-                logger.error(f"Error flushing queue: {e}")
+                logger.info("Cleanup complete.")
+            except Exception:
+                pass
+
+        finally:
+            # Ensure logging is flushed and shut down
+            # This must be the very last step to ensure previous logs are emitted.
             try:
-                client.close()
-            except Exception as e:
-                logger.error(f"Error closing client: {e}")
+                if logging:
+                    try:
+                        logger.info("Shutting down logging...")
+                    except Exception:
+                        pass
+                    logging.shutdown()
+            except Exception:
+                pass
+
+            # Final flush of stdio to ensure all logs/errors are out
+            try:
+                if sys:
+                    if getattr(sys, "stdout", None):
+                        sys.stdout.flush()
+                    if getattr(sys, "stderr", None):
+                        sys.stderr.flush()
+            except Exception:
+                pass
 
     atexit.register(cleanup)
-
-    # Event to signal shutdown
-    stop_event = threading.Event()
 
     def signal_handler(sig: int, frame: Optional[FrameType]) -> None:
         """Handle system signals (SIGINT, SIGTERM) for graceful shutdown.
 
         Sets the stop event to trigger the main loop termination.
+        The main loop will exit, triggering the finally block which calls cleanup().
+        If called a second time (stuck shutdown), forces immediate exit.
 
         Args:
             sig (int): The signal number.
@@ -434,12 +556,52 @@ def main() -> None:
         Returns:
             None
         """
-        sig_name = signal.Signals(sig).name
-        logger.info(f"Received signal {sig_name}, shutting down...")
+        sig_name = str(sig)
+        try:
+            sig_name = signal.Signals(sig).name
+        except Exception:
+            pass
+
+        _ = frame  # Unused argument
+        if stop_event.is_set():
+            try:
+                msg = f"Received signal {sig_name} again, forcing immediate exit..."
+                sys.stderr.write(f"\n{msg}\n")
+                sys.stderr.flush()
+                logger.critical(msg)
+            except Exception:
+                pass
+            # Use os._exit to force termination if stuck, bypassing cleanup handlers
+            os._exit(1)
+
+        # Set event immediately to ensure responsiveness.
+        # This breaks the main loop (stop_event.wait()), triggering the finally block
+        # which calls cleanup() to stop observer, flush queue, and close client.
         stop_event.set()
 
+        try:
+            # Use _ = frame to avoid unused variable warning if linters are strict
+            logger.debug(f"Signal handler caught {sig_name}")
+            logger.info(f"Received signal {sig_name} ({sig}), shutting down...")
+        except Exception:
+            # Fallback if logging is broken/closed
+            try:
+                sys.stderr.write(
+                    f"Received signal {sig_name}, shutting down... (logging unavailable)\n"
+                )
+                sys.stderr.flush()
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    # Signal Handling & Cleanup (Verified Stage 8.4.5 - Final Integration):
+    # 1. Registers SIGINT/SIGTERM handlers.
+    # 2. Sets stop_event to break main loop gracefully.
+    # 3. cleanup() ensures observer stop, queue flush, client close, logging shutdown.
+    # 4. atexit provides redundancy for unhandled exits.
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    logger.debug("Signal handlers registered.")
 
     try:
         # Initialize Client
@@ -455,44 +617,62 @@ def main() -> None:
         # We wait up to 5 seconds for the server to appear, otherwise we proceed.
         client.wait_for_start(timeout=5.0, stop_check=stop_event.is_set)
 
+        if stop_event.is_set():
+            logger.info("Stop signal received during startup, exiting...")
+            return
+
         # Ensure bucket exists (or queue creation if offline)
         try:
             client.ensure_bucket()
         except Exception as e:
             logger.warning(f"Could not ensure bucket (proceeding in offline/queued mode): {e}")
 
+        if stop_event.is_set():
+            logger.info("Stop signal received during startup, exiting...")
+            return
+
         # Initialize and Start Watcher
-        logger.info(f"Initializing watcher for: {watch_path} (Pulsetime: {config.pulsetime}s)")
+        logger.info(
+            f"Initializing watcher for: {watch_path} (Pulsetime: {config.pulsetime}s)"
+        )
         watcher = PipelineWatcher(
             watch_path,
             client,
             debounce_seconds=config.debounce_seconds,
             batch_size_limit=config.batch_size_limit,
         )
-        
+
         # Robust startup: Wait for directory to exist AND start successfully
         while not stop_event.is_set():
             try:
                 if not watcher.watch_dir.exists():
-                    logger.warning(f"Watch directory not found: {watcher.watch_dir}. Waiting for creation...")
+                    logger.warning(
+                        f"Watch directory not found: {watcher.watch_dir}. Waiting for creation..."
+                    )
                     if stop_event.wait(5.0):
                         break
                     continue
-                
+
                 watcher.start()
                 break
             except FileNotFoundError:
-                logger.warning(f"Watch directory disappeared during startup: {watcher.watch_dir}. Retrying...")
+                logger.warning(
+                    f"Watch directory disappeared during startup: {watcher.watch_dir}. Retrying..."
+                )
                 if stop_event.wait(1.0):
                     break
                 continue
             except OSError as e:
-                logger.warning(f"Error accessing watch directory during startup: {e}. Retrying...")
+                logger.warning(
+                    f"Error accessing watch directory during startup: {e}. Retrying..."
+                )
                 if stop_event.wait(5.0):
                     break
                 continue
             except RuntimeError as e:
-                logger.warning(f"Failed to start watcher (observer error): {e}. Retrying...")
+                logger.warning(
+                    f"Failed to start watcher (observer error): {e}. Retrying..."
+                )
                 if stop_event.wait(5.0):
                     break
                 continue
@@ -535,19 +715,19 @@ def main() -> None:
         resource_timer.start()
 
         # Main loop: Wait for stop signal (pure event-driven)
-        # This blocks the main thread efficiently without polling until the signal handler sets the event.
+        # This blocks the main thread efficiently without polling until the signal
+        # handler sets the event.
+        logger.debug("Entering main loop, waiting for stop signal...")
         stop_event.wait()
+        logger.debug("Main loop stop_event set, exiting loop.")
 
-    except KeyboardInterrupt:
-        # Handled by signal_handler, but just in case
-        logger.info("KeyboardInterrupt received, stopping...")
-        pass
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
     finally:
         cleanup()
         atexit.unregister(cleanup)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

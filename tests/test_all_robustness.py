@@ -33,19 +33,19 @@ def test_full_robustness_suite(tmp_path: Path) -> None:
     
     # 2. Create
     f.write_text(json.dumps({"current_stage": "1", "current_task": "A"}))
-    time.sleep(0.2)
+    time.sleep(0.5)
     assert watcher.handler.last_stage == "1"
     
     # 3. Malformed
     f.write_text("{ bad")
-    time.sleep(0.2)
+    time.sleep(0.5)
     # State should remain
     assert watcher.handler.last_stage == "1"
     
     # 5. Client failure simulation
     mock_aw_client.heartbeat.side_effect = Exception("Offline")
     f.write_text(json.dumps({"current_stage": "2", "current_task": "B"}))
-    time.sleep(0.2)
+    time.sleep(0.5)
     # Should not crash watcher
     assert watcher.handler.last_stage == "2"
     

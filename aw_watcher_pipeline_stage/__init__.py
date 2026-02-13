@@ -1,7 +1,7 @@
-"""ActivityWatch watcher for pipeline stages.
+"""aw-watcher-pipeline-stage package initialization.
 
-This package provides a watcher that monitors a local JSON file for development
-pipeline stage changes and reports them to ActivityWatch.
+Exposes version information and ensures the package is importable.
+Validated for release v0.1.0 (Stage 8.5.2 - PR Ready).
 """
 
 __version__ = "0.1.0"

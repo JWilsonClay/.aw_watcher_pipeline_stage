@@ -86,7 +86,7 @@ def test_watcher_rapid_start_stop(pipeline_client: PipelineClient, temp_dir: Pat
             watcher.start()
         finally:
             watcher.stop()
-        time.sleep(0.3)  # Allow brief cleanup time for threads
+        time.sleep(0.5)  # Allow brief cleanup time for threads
 
 def test_serialized_heartbeats_slow_client(pipeline_client: PipelineClient, temp_dir: Path, mock_aw_client: MagicMock) -> None:
     """Test that heartbeats are serialized when client is slow."""

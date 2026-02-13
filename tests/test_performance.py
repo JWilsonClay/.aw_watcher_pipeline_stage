@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-Performance validation and profiling script.
+"""Performance validation and profiling script.
 
-Stage 6.1.4: Profile debounce and heartbeat paths with visualization support.
+Stage 6.1.4 / 8.5.3: Profile debounce, heartbeat paths, and verify final release metrics.
 
 Modes:
 1. Performance Metrics (pytest): Measures CPU/RAM during idle and active states.
@@ -17,6 +16,8 @@ Modes:
 Prerequisites for Visualizations:
    poetry add --group dev matplotlib psutil line_profiler
 """
+from __future__ import annotations
+
 import cProfile
 import io
 import pstats
@@ -56,8 +57,10 @@ from aw_watcher_pipeline_stage.client import MockActivityWatchClient, PipelineCl
 from aw_watcher_pipeline_stage.watcher import PipelineWatcher
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("test_performance")
+LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(name)s: %(message)s'
+LOG_DATE_FORMAT = '%Y-%m-%dT%H:%M:%S'
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+logger = logging.getLogger("test_performance")  # Name
 
 def measure_resources(duration: int, interval: float = 1.0) -> Dict[str, float]:
     """Measure CPU and Memory usage over a duration."""
@@ -1175,27 +1178,32 @@ def run_full_report(tmp_path: Path, save_path: Optional[Path] = None, profile_ex
     
     # Executive Summary Table
     full_report.write("### Executive Summary\n\n")
-    full_report.write("| Metric | Value | Target | Status |\n")
-    full_report.write("| :--- | :--- | :--- | :--- |\n")
+    full_report.write("| Metric | Target | Result | Source | Status |\n")
+    full_report.write("| :--- | :--- | :--- | :--- | :--- |\n")
     
     # Burst
     burst_time = m1.get('burst_duration_s', 0.0)
     burst_status = "✅" if burst_time < 5.0 else "❌"
-    full_report.write(f"| **Burst Time (1000 events)** | {burst_time:.4f}s | < 5.0s | {burst_status} |\n")
+    full_report.write(f"| **Burst Processing** | < 5.0s (1000 events) | **{burst_time:.4f}s** | `test_performance.py` | {burst_status} |\n")
     
     # Latency
     lat_avg = m2.get('online_ms', 0.0)
     lat_max = m2.get('online_max_ms', 0.0)
     lat_status = "✅" if lat_avg < 20.0 else "❌"
-    full_report.write(f"| **Heartbeat Latency** | Avg: {lat_avg:.3f}ms / Max: {lat_max:.3f}ms | < 20ms (Avg) | {lat_status} |\n")
+    full_report.write(f"| **Latency (Heartbeat)** | < 20ms (Avg) | **{lat_avg:.3f}ms** (Avg) | `test_performance.py` | {lat_status} |\n")
     
     # CPU
     if m3:
         idle_cpu = m3.get('idle_cpu_avg', 0.0)
         cpu_status = "✅" if idle_cpu < 1.0 else "❌"
-        full_report.write(f"| **Idle CPU Avg** | {idle_cpu:.2f}% | < 1% | {cpu_status} |\n")
+        full_report.write(f"| **Resource Usage (CPU)** | < 1% Avg | **{idle_cpu:.2f}%** | `test_performance.py` | {cpu_status} |\n")
+        
+        idle_rss = m3.get('idle_rss_peak', 0.0)
+        rss_status = "✅" if idle_rss < 50.0 else "❌"
+        full_report.write(f"| **Resource Usage (RAM)** | < 50 MB RSS | **{idle_rss:.2f} MB** | `test_performance.py` | {rss_status} |\n")
     else:
-        full_report.write(f"| **Idle CPU Avg** | N/A | < 1% | ❓ (psutil missing) |\n")
+        full_report.write(f"| **Resource Usage (CPU)** | < 1% Avg | N/A | `test_performance.py` | ❓ (psutil missing) |\n")
+        full_report.write(f"| **Resource Usage (RAM)** | < 50 MB RSS | N/A | `test_performance.py` | ❓ (psutil missing) |\n")
         
     full_report.write("\n")
     
@@ -1278,7 +1286,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-profiles", type=str, help="Directory to save .prof files for external visualization")
     args = parser.parse_args()
     
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+    # logging.basicConfig called at top level, but force=True here would allow overriding if args supported log level
     
     if psutil is None:
         print("Error: psutil is not installed. Cannot run performance tests.")
@@ -1392,8 +1400,9 @@ if __name__ == "__main__":
         print("-" * 40)
 
         failures = []
-        if stats['cpu_avg'] >= 5.0:
-            failures.append(f"CPU Avg {stats['cpu_avg']:.2f}% >= 5.0%")
+        target_cpu = 5.0 if args.scenario == "active" else 1.0
+        if stats['cpu_avg'] >= target_cpu:
+            failures.append(f"CPU Avg {stats['cpu_avg']:.2f}% >= {target_cpu}%")
         if stats['rss_peak'] >= 50.0:
             failures.append(f"RSS Peak {stats['rss_peak']:.2f}MB >= 50.0MB")
         if not pulsetime_valid:

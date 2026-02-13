@@ -653,7 +653,7 @@ Performance profiling, benchmarks, and optimization findings are tracked in [PER
 ## Stage 7.5.2: Documentation Finalization
 
 **Date**: 2025-06-05
-**Status**: Complete. See `MAINTAINABILITY.md` for the full documentation completeness report.
+**Status**: Complete. See MAINTAINABILITY.md for the full documentation completeness report.
 
 ## Stage 7.5.4: Regression Testing
 

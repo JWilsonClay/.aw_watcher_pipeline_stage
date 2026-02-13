@@ -1,0 +1,78 @@
+# Manifest for source distribution
+# Verified for Release v0.1.0 (Stage 9.1.3)
+include LICENSE
+include README.md
+include pyproject.toml
+include poetry.lock
+include ARCHITECTURE.md
+include CONTRIBUTING.md
+include MAINTAINABILITY.md
+include PERFORMANCE.md
+include SECURITY_AUDIT.md
+include TESTING.md
+include CHANGELOG.md
+
+recursive-include aw_watcher_pipeline_stage *.py
+recursive-include aw_watcher_pipeline_stage py.typed
+
+# Include documentation source
+graft docs
+
+# Exclude tests and dev configs
+recursive-exclude tests *
+recursive-exclude .github *
+exclude .gitignore
+exclude .pre-commit-config.yaml
+exclude stage0RFI.md
+exclude INTEGRATION_REVIEW.md
+exclude development_pipeline_ActivityWatch_fork.md
+exclude config.ini
+exclude current_task.json
+exclude .python-version
+
+# Exclude development scripts
+exclude aw_watcher_pipeline_stage/manual_test.py
+exclude aw_watcher_pipeline_stage/test_edge_cases.py
+
+# Exclude bytecode and caches
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.log
+global-exclude .DS_Store
+global-exclude *.spec
+global-exclude *.manifest
+global-exclude MANIFEST
+global-exclude pip-log.txt
+global-exclude *.egg-info
+global-exclude *.egg
+global-exclude stability_report.txt
+
+# Exclude build artifacts, caches, and project specific ignores
+prune build
+prune dist
+prune profiles
+prune site
+prune htmlcov
+prune docs/_build
+prune target
+prune .tox
+prune .nox
+prune .venv
+prune env
+prune venv
+prune ENV
+prune __pypackages__
+prune .hypothesis
+prune .idea
+prune .vscode
+prune .mypy_cache
+prune .pytest_cache
+prune .ipynb_checkpoints
+prune .cache
+prune cover
+prune instance
+exclude .coverage
+exclude coverage.xml
+exclude nosetests.xml
+exclude .env

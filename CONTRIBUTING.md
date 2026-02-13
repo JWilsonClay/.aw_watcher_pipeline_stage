@@ -41,6 +41,8 @@ Tests cover:
 *   Security (symlink attacks, path traversal).
 *   Robustness (malformed data, permission errors).
 
+For a detailed testing strategy, see [TESTING.md](TESTING.md).
+
 ## Pull Request Guidelines
 
 1.  **Feature Branches**: Create a new branch for your changes (e.g., `feature/my-feature` or `fix/issue-123`).

@@ -1,5 +1,4 @@
-"""
-File system watcher implementation using watchdog.
+"""File system watcher implementation using watchdog.
 
 Responsibility:
     This module follows the **Single Responsibility Principle** by being solely responsible
@@ -7,8 +6,8 @@ Responsibility:
     current state of the pipeline. It delegates communication to the `client` module.
 
 Design:
-    - **Event-Driven**: Uses `watchdog` to react to file system events (modified, created,
-      moved, deleted) instead of polling, ensuring low CPU usage.
+    - **Event-Driven**: Uses `watchdog` to react to file system events (modified,
+      created, moved, deleted) instead of polling, ensuring low CPU usage.
     - **Debouncing**: Implements a `DebounceTimer` to coalesce rapid bursts of events
       (e.g., atomic writes or rapid saves) into a single processing action.
     - **State Comparison**: Only triggers heartbeats when the meaningful content of the
@@ -29,36 +28,32 @@ from __future__ import annotations
 import json
 import logging
 import stat
+import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING, Type, Union
+from typing import Any, Callable, Deque, Dict, Optional, Tuple, TYPE_CHECKING, Type, Union
 
 from watchdog.events import FileMovedEvent, FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
+import watchdog.observers.polling
+
+from aw_watcher_pipeline_stage.client import VALID_STATUSES
 
 if TYPE_CHECKING:
     from aw_watcher_pipeline_stage.client import PipelineClient
 
-try:
-    import orjson
-except ImportError:
-    orjson = None  # type: ignore
+__all__ = ["PipelineWatcher", "PipelineEventHandler", "DebounceTimer"]
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 MAX_FILE_SIZE_BYTES = 10 * 1024  # 10 KB (Security: DoS prevention)
-VALID_STATUSES = {"in_progress", "paused", "completed"}
 
-if orjson:
-    JSON_DECODE_EXCEPTIONS: Tuple[Type[Exception], ...] = (json.JSONDecodeError, orjson.JSONDecodeError)
-    json_loads = orjson.loads
-else:
-    JSON_DECODE_EXCEPTIONS = (json.JSONDecodeError,)
-    json_loads = json.loads
+JSON_DECODE_EXCEPTIONS: Tuple[Type[Exception], ...] = (json.JSONDecodeError,)
+json_loads = json.loads
 
 
 class DebounceTimer:
@@ -69,7 +64,15 @@ class DebounceTimer:
         callback (Callable[[], None]): The function to call when the timer fires.
     """
 
-    __slots__ = ('interval', 'callback', '_condition', '_target_time', '_active', '_stopped', '_thread')
+    __slots__ = (
+        "interval",
+        "callback",
+        "_condition",
+        "_target_time",
+        "_active",
+        "_stopped",
+        "_thread",
+    )
 
     def __init__(self, interval: float, callback: Callable[[], None]) -> None:
         """Initialize the debounce timer.
@@ -173,7 +176,7 @@ class DebounceTimer:
                         logger.error("Error in debounce callback", exc_info=True)
                     finally:
                         self._condition.acquire()
-                    
+
                     # If rescheduled during callback, continue loop
                     if self._active:
                         continue
@@ -182,7 +185,7 @@ class DebounceTimer:
                         break
 
                 self._condition.wait(wait_time)
-            
+
             if not self._active or self._stopped:
                 self._thread = None
 
@@ -233,18 +236,17 @@ class PipelineEventHandler(FileSystemEventHandler):
         """
         try:
             # Security: Use absolute() instead of resolve() to avoid following symlinks
-            self.watch_path = watch_path.absolute()
-        except (OSError, RuntimeError):
+            # Ensure user expansion happens if not already done
+            self.watch_path = watch_path.expanduser().absolute()
+        except (OSError, RuntimeError) as e:
+            self.logger.debug(f"Path expansion failed in handler: {e}. Using absolute path.")
             self.watch_path = watch_path.absolute()
 
         self.client = client
         self.debounce_seconds = debounce_seconds
         self.logger = logger or logging.getLogger(__name__)
 
-        if orjson:
-            self.logger.debug("Using orjson for JSON parsing")
-        else:
-            self.logger.debug("Using stdlib json for JSON parsing")
+        self.logger.debug("Using stdlib json for JSON parsing")
 
         if self.debounce_seconds < 0.1:
             self.logger.warning(
@@ -260,29 +262,22 @@ class PipelineEventHandler(FileSystemEventHandler):
             elif self.watch_path.exists():
                 self.target_file = self.watch_path
             else:
-                # Path does not exist. Use heuristic: if suffix present, assume file.
-                if self.watch_path.suffix:
-                    self.target_file = (
-                        self.watch_path
-                    )  # Explicitly set to avoid mypy confusion if needed
-                else:
-                    self.target_file = self.watch_path / "current_task.json"
+                # Path does not exist. Config validation ensures parent exists.
+                # Assume it is a file (since we can't watch a non-existent directory).
+                self.target_file = self.watch_path
         except (OSError, RuntimeError) as e:
             self.logger.debug(
                 f"Filesystem check failed during init, using heuristic fallback: {e}"
             )
             # Fallback if filesystem check fails
-            if self.watch_path.suffix:
-                self.target_file = self.watch_path
-            else:
-                self.target_file = self.watch_path / "current_task.json"
+            self.target_file = self.watch_path
 
         self.target_file_str = str(self.target_file)
 
         self._lock = threading.Lock()
 
         # State variables
-        self._event_queue: deque[FileSystemEvent] = deque()
+        self._event_queue: Deque[FileSystemEvent] = deque()
         self._debounce_timer = DebounceTimer(self.debounce_seconds, self._on_debounce_fired)
         self.last_comparison_data: Optional[Dict[str, Any]] = None
         self.last_stage: Optional[str] = None
@@ -381,7 +376,9 @@ class PipelineEventHandler(FileSystemEventHandler):
         if file_path != self.target_file_str:
             try:
                 event_path = Path(file_path).absolute()
-                # Security: Ensure we only process the resolved target file (no symlink following).
+                # Security: Ensure we only process the resolved target file
+                # (no symlink following).
+                # Cross-Platform: Path comparison handles separator differences and case-insensitivity (on Windows)
                 if event_path != self.target_file:
                     # Strict path checking: Do not follow symlinks or resolve paths
                     return
@@ -406,7 +403,8 @@ class PipelineEventHandler(FileSystemEventHandler):
             self._dropped_events += 1
             if now - self._last_dropped_log_time > 5.0:
                 self.logger.warning(
-                    f"Rate limit exceeded (DoS prevention). Dropping excess events for {file_path}. "
+                    "Rate limit exceeded (DoS prevention). Dropping excess events for "
+                    f"{file_path}. "
                     f"Total dropped: {self._dropped_events}"
                 )
                 self._last_dropped_log_time = now
@@ -426,7 +424,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                 if len(self._event_queue) >= self.batch_size_limit:
                     self._debounce_timer.trigger_now()
                     if self.logger.isEnabledFor(logging.DEBUG):
-                        self.logger.debug(f"Batch limit reached ({len(self._event_queue)}), forcing process for {file_path}")
+                        self.logger.debug(
+                            f"Batch limit reached ({len(self._event_queue)}), forcing process for {file_path}"
+                        )
                 else:
                     self._debounce_timer.schedule()
                     if self.logger.isEnabledFor(logging.DEBUG):
@@ -442,12 +442,12 @@ class PipelineEventHandler(FileSystemEventHandler):
         """
         if self._stopped:
             return
-            
+
         batch_size = 0
         with self._lock:
             batch_size = len(self._event_queue)
             self._event_queue.clear()
-            
+
         # Process batch outside the lock (I/O)
         if batch_size > 0:
             self._process_batch(batch_size)
@@ -469,26 +469,26 @@ class PipelineEventHandler(FileSystemEventHandler):
             None
         """
         file_path = str(self.target_file)
-        
+
         if batch_size > 1:
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
                     f"Batch processing {batch_size} coalesced events for {file_path}"
                 )
             self.total_debounced_events += (batch_size - 1)
-        
+
         if self._stopped:
             return
         try:
             # 1. Perform I/O outside the lock
             raw_data = self._read_file_data(file_path)
-            
+
             if self._stopped:
                 return
 
             data_to_send = None
             elapsed = 0.0
-            
+
             # 2. Update state inside the lock
             with self._lock:
                 if self._stopped:
@@ -496,7 +496,7 @@ class PipelineEventHandler(FileSystemEventHandler):
 
                 if raw_data:
                     data_to_send = self._process_state_change(raw_data, file_path)
-                
+
                 if data_to_send:
                     elapsed = max(0.0, time.monotonic() - self.last_change_time)
 
@@ -605,7 +605,7 @@ class PipelineEventHandler(FileSystemEventHandler):
                             return None
                         backoff *= 2
                         continue
-                    
+
                     # Invalidate cache on persistent stat failure (e.g. file deleted/inaccessible)
                     self._invalidate_cache()
                     # If we fail stat repeatedly, we likely can't open it either, but let's fall through to open() try/except or return
@@ -635,7 +635,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                         now = time.monotonic()
                         if now - self._last_file_size_warning_time > 60.0:
                             self.logger.warning(
-                                f"File {file_path} is too large ({file_stat.st_size} bytes). Truncating to {MAX_FILE_SIZE_BYTES} bytes."
+                                f"File {file_path} is too large "
+                                f"({file_stat.st_size} bytes). "
+                                f"Truncating to {MAX_FILE_SIZE_BYTES} bytes."
                             )
                             self._last_file_size_warning_time = now
 
@@ -647,13 +649,17 @@ class PipelineEventHandler(FileSystemEventHandler):
                             now = time.monotonic()
                             if now - self._last_file_size_warning_time > 60.0:
                                 self.logger.warning(
-                                    f"File {file_path} is too large (> {MAX_FILE_SIZE_BYTES} bytes). Truncating and attempting partial parse."
+                                    f"File {file_path} is too large "
+                                    f"(> {MAX_FILE_SIZE_BYTES} bytes). "
+                                    "Truncating and attempting partial parse."
                                 )
                                 self._last_file_size_warning_time = now
 
                         if not content_bytes.strip():
                             if attempt < max_attempts - 1:
-                                self.logger.debug(f"File {file_path} is empty or whitespace only, retrying in {backoff}s...")
+                                self.logger.debug(
+                                    f"File {file_path} is empty or whitespace only, retrying in {backoff}s..."
+                                )
                                 time.sleep(backoff)
                                 if self._stopped:
                                     return None
@@ -697,7 +703,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                     else:
                         now = time.monotonic()
                         if now - self.last_read_error_time > 60.0:
-                            self.logger.error(f"Encoding error in {file_path} after {max_attempts} attempts: {e}")
+                            self.logger.error(
+                                f"Encoding error in {file_path} after {max_attempts} attempts: {e}"
+                            )
                             self.last_read_error_time = now
                         with self._lock:
                             self.parse_errors += 1
@@ -711,10 +719,12 @@ class PipelineEventHandler(FileSystemEventHandler):
                             return None
                         backoff *= 2
                         continue
-                    
+
                     now = time.monotonic()
                     if now - self.last_read_error_time > 60.0:
-                        self.logger.warning(f"Permission denied for {file_path} after {max_attempts} attempts: {e}")
+                        self.logger.warning(
+                            f"Permission denied for {file_path} after {max_attempts} attempts: {e}"
+                        )
                         self.last_read_error_time = now
                     with self._lock:
                         self.parse_errors += 1
@@ -737,8 +747,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                                 f"Malformed JSON in {file_path} after {max_attempts} attempts."
                             )
                             self.last_read_error_time = now
-                        
+
                         if self.logger.isEnabledFor(logging.DEBUG):
+                            # Audit (Stage 8.4.3): Privacy - Content logging restricted to DEBUG and truncated.
                             self.logger.debug(f"JSON Decode Error: {e}")
                             snippet = content_bytes[:50].decode("utf-8", errors="replace").replace("\n", "\\n")
                             self.logger.debug(f"JSON Snippet: '{snippet}'")
@@ -751,7 +762,8 @@ class PipelineEventHandler(FileSystemEventHandler):
                     now = time.monotonic()
                     if now - self.last_read_error_time > 60.0:
                         self.logger.error(
-                            f"JSON recursion limit exceeded in {file_path}: {e} (Possible DoS attempt)"
+                            f"JSON recursion limit exceeded in {file_path}: {e} "
+                            "(Possible DoS attempt)"
                         )
                         self.last_read_error_time = now
                     with self._lock:
@@ -787,7 +799,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                     else:
                         now = time.monotonic()
                         if now - self.last_read_error_time > 60.0:
-                            self.logger.error(f"Error processing {file_path} after {max_attempts} attempts: {e}")
+                            self.logger.error(
+                                f"Error processing {file_path} after {max_attempts} attempts: {e}"
+                            )
                             self.last_read_error_time = now
                         with self._lock:
                             self.parse_errors += 1
@@ -796,7 +810,9 @@ class PipelineEventHandler(FileSystemEventHandler):
                 except Exception as e:
                     now = time.monotonic()
                     if now - self.last_read_error_time > 60.0:
-                        self.logger.error(f"Unexpected error processing {file_path}: {e}", exc_info=True)
+                        self.logger.error(
+                            f"Unexpected error processing {file_path}: {e}", exc_info=True
+                        )
                         self.last_read_error_time = now
                     with self._lock:
                         self.parse_errors += 1
@@ -885,7 +901,8 @@ class PipelineEventHandler(FileSystemEventHandler):
                     status = status.strip().lower()
                     if status not in VALID_STATUSES:
                         self.logger.warning(
-                            f"Invalid status value in {file_path}. Expected: {', '.join(sorted(VALID_STATUSES))}."
+                            f"Invalid status value in {file_path}. "
+                            f"Expected: {', '.join(sorted(VALID_STATUSES))}."
                         )
                         status = "in_progress"
             else:
@@ -902,6 +919,7 @@ class PipelineEventHandler(FileSystemEventHandler):
 
             # Security: Filter metadata early if allowlist is configured
             # This prevents blocked data from being stored in memory or triggering updates
+            # Audit (Stage 8.4.3): Verified metadata filtering for privacy compliance.
             if getattr(self.client, "metadata_allowlist", None) is not None:
                 allowlist = self.client.metadata_allowlist
                 metadata = {k: v for k, v in metadata.items() if k in allowlist}
@@ -1008,7 +1026,7 @@ class PipelineEventHandler(FileSystemEventHandler):
             if self._heartbeat_timer:
                 self._heartbeat_timer.cancel()
                 self._heartbeat_timer = None
-            
+
             if not self._stopped and not self.is_paused and self.current_data:
                 self._heartbeat_timer = threading.Timer(30.0, self._periodic_heartbeat_task)
                 self._heartbeat_timer.daemon = True
@@ -1025,17 +1043,17 @@ class PipelineEventHandler(FileSystemEventHandler):
         """
         if self._stopped:
             return
-            
+
         data_to_send = None
         elapsed = 0.0
-        
+
         with self._lock:
             # Verify we should still send
             if self._stopped or self.is_paused or not self.current_data:
                 return
             data_to_send = self.current_data.copy()
             elapsed = max(0.0, time.monotonic() - self.last_change_time)
-            
+
         if data_to_send:
             # Send heartbeat (I/O outside lock)
             self._send_heartbeat(data_to_send, elapsed)
@@ -1055,15 +1073,16 @@ class PipelineEventHandler(FileSystemEventHandler):
         Returns:
             None
         """
+        # Audit (Stage 8.4.3): Log Privacy - Only stage/task/project logged at INFO level. No metadata/content.
         msg = f"State changed: {data.get('current_stage')} - {data.get('current_task')}"
         if data.get("project_id"):
             msg += f" (Project: {data.get('project_id')})"
         self.logger.info(msg)
-        
+
         with self._heartbeat_lock:
             if not self._stopped:
                 self._send_heartbeat(data, elapsed)
-        
+
         # Reset/Start periodic timer
         self._schedule_periodic_heartbeat()
 
@@ -1095,7 +1114,7 @@ class PipelineEventHandler(FileSystemEventHandler):
                 file_path=data.get("file_path"),
                 computed_duration=elapsed,
             )
-            
+
             with self._lock:
                 self.heartbeats_sent += 1
                 now = time.monotonic()
@@ -1113,7 +1132,7 @@ class PipelineEventHandler(FileSystemEventHandler):
             self.heartbeat_latency = hb_duration
             if hb_duration > self.max_heartbeat_latency:
                 self.max_heartbeat_latency = hb_duration
-            
+
             if hb_duration > 5.0:
                 self.logger.warning(f"Slow heartbeat sending detected: {hb_duration:.2f}s")
 
@@ -1128,11 +1147,11 @@ class PipelineEventHandler(FileSystemEventHandler):
         """
         state_change_data = None
         elapsed = 0.0
-        
+
         # Perform I/O outside lock if needed for self-healing
         healing_data = None
         now = time.monotonic()
-        
+
         # Optimization: Only attempt healing if we lack data (e.g. startup fail or deleted)
         needs_healing = False
         with self._lock:
@@ -1381,6 +1400,13 @@ class PipelineWatcher:
     `PipelineEventHandler`. Ensure the observer is restarted if it fails
     and handle graceful shutdown.
 
+    Audit (Stage 8.4.5): Verified resource usage monitoring and graceful shutdown integration.
+
+    Cross-Platform Support:
+        - Uses `pathlib` for OS-agnostic path handling.
+        - Automatically falls back to `PollingObserver` if the native observer fails
+          (e.g., on network shares, Docker mounts, or specific Windows/macOS configurations).
+
     Attributes:
         path (Path): The resolved absolute path being watched.
         client (PipelineClient): Client for sending heartbeats.
@@ -1414,9 +1440,15 @@ class PipelineWatcher:
         """
         try:
             # Security: Use absolute() instead of resolve() to avoid following symlinks
+            # Expand user (~) first
+            self.path = Path(path).expanduser().absolute()
+        except (OSError, RuntimeError) as e:
+            # Fallback if expanduser fails (e.g. no home dir)
+            logger.debug(f"Path expansion failed in watcher: {e}. Using absolute path.")
             self.path = Path(path).absolute()
-        except (OSError, RuntimeError):
-            self.path = Path(path).absolute()
+
+        if debounce_seconds < 0:
+            raise ValueError(f"debounce_seconds must be non-negative, got {debounce_seconds}")
 
         self.client = client
         self._observer: Optional[Observer] = None
@@ -1428,7 +1460,7 @@ class PipelineWatcher:
         self._health_check_timer: Optional[threading.Timer] = None
 
         self.watch_dir: Path
-        
+
         # Determine directory to watch
         try:
             if self.path.is_dir():
@@ -1436,17 +1468,11 @@ class PipelineWatcher:
             elif self.path.exists():
                 self.watch_dir = self.path.parent
             else:
-                # Path does not exist. Use heuristic.
-                if self.path.suffix:
-                    self.watch_dir = self.path.parent
-                else:
-                    self.watch_dir = self.path
+                # Path does not exist. Config validation ensures parent exists.
+                self.watch_dir = self.path.parent
         except (OSError, RuntimeError):
             # Fallback
-            if self.path.suffix:
-                self.watch_dir = self.path.parent
-            else:
-                self.watch_dir = self.path
+            self.watch_dir = self.path.parent
 
         self.handler = PipelineEventHandler(
             self.path,
@@ -1471,13 +1497,13 @@ class PipelineWatcher:
             if self._observer is None or not self._observer.is_alive():
                 if self._observer is not None:
                     logger.critical("Watchdog observer found dead.")
-                
+
                 now = time.monotonic()
                 if now - self._last_observer_restart_attempt > 10.0:
                     logger.info("Attempting to restart observer...")
                     self._start_observer()
                     self._last_observer_restart_attempt = now
-        
+
         if self._observer is None:
             raise RuntimeError("Observer is not available (down or initializing)")
         return self._observer
@@ -1486,6 +1512,7 @@ class PipelineWatcher:
         """Start or restart the observer.
 
         Attempts to create and start a new Observer instance. Retries on failure.
+        Falls back to PollingObserver if native Observer fails.
 
         Returns:
             None
@@ -1505,7 +1532,7 @@ class PipelineWatcher:
                             logger.debug(f"Error joining dead observer: {e}")
                             pass
                     self._observer = Observer()
-                
+
                 # If it's already alive (e.g. race condition), skip
                 if self._observer.is_alive():
                     return
@@ -1514,24 +1541,50 @@ class PipelineWatcher:
                 # Security: recursive=False to prevent watching subdirectories.
                 # Security: We watch the resolved directory to handle atomic writes (rename),
                 # but filter events in handler to ensure we only process the target file.
-                self._observer.schedule(self.handler, str(self.watch_dir), recursive=False)
+                if isinstance(self._observer, watchdog.observers.polling.PollingObserver):
+                    logger.warning("Watchdog fell back to PollingObserver. This may increase CPU usage.")
+                # Cross-platform: Watching directory handles file recreation/deletion reliably on all OSs.
+                self._observer.schedule(
+                    self.handler, str(self.watch_dir), recursive=False
+                )
                 self._observer.start()
                 logger.info(f"Observer started ({type(self._observer).__name__})")
                 if attempt > 0:
                     logger.info(f"Observer recovered successfully on attempt {attempt + 1}")
                 self._last_observer_restart_attempt = time.monotonic()
                 return
-            except OSError as e:
-                logger.error(
-                    f"OS Error starting observer (attempt {attempt + 1}/{max_retries}): {e} (Check inotify limits?)"
-                )
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)
             except Exception as e:
-                logger.error(f"Failed to start observer (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.error(
+                    f"Error starting observer (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+
+                # Fallback to PollingObserver if native observer fails
+                if attempt == max_retries - 1:
+                    try:
+                        logger.warning(
+                            f"Native Observer failed ({e}) on {sys.platform}. "
+                            "Falling back to PollingObserver (Cross-platform compatibility mode)."
+                        )
+                        # Explicitly discard the failed observer to ensure cleanup
+                        self._observer = None
+
+                        # PollingObserver is platform-independent and works on all OSs (at cost of CPU)
+                        polling_obs = watchdog.observers.polling.PollingObserver()
+                        polling_obs.schedule(
+                            self.handler, str(self.watch_dir), recursive=False
+                        )
+                        polling_obs.start()
+                        self._observer = polling_obs
+                        logger.info(f"PollingObserver ({type(polling_obs).__name__}) started successfully as fallback.")
+                        logger.warning("PollingObserver is active. This ensures compatibility but may have higher latency/CPU usage.")
+                        self._last_observer_restart_attempt = time.monotonic()
+                        return
+                    except Exception as e2:
+                        logger.error(f"PollingObserver fallback failed: {e2}")
+
                 if attempt < max_retries - 1:
                     time.sleep(0.5)
-        
+
         self._last_observer_restart_attempt = time.monotonic()
         logger.critical("Could not start observer after retries.")
 
@@ -1635,7 +1688,7 @@ class PipelineWatcher:
         except OSError as e:
             logger.debug(f"Error checking directory existence: {e}")
             current_exists = False
-        
+
         if current_exists and not self._watch_dir_existed:
             logger.info(
                 f"Watch directory reappeared: {self.watch_dir}. Restarting observer."
@@ -1645,7 +1698,7 @@ class PipelineWatcher:
                 self._observer.join(timeout=1.0)
             self._observer = None
             self._start_observer()
-            
+
             # Trigger immediate parse if target file exists
             try:
                 if self.handler.target_file.exists():
@@ -1660,7 +1713,7 @@ class PipelineWatcher:
                         self.handler.on_state_changed(data, 0.0)
             except OSError as e:
                 logger.warning(f"Failed to check target file during recovery: {e}")
-        
+
         self._watch_dir_existed = current_exists
 
         # Access property to ensure observer is alive
@@ -1725,4 +1778,5 @@ class PipelineWatcher:
         Returns:
             str: String representation including path and observer status.
         """
-        return f"<PipelineWatcher path={self.path} observer={'alive' if self._observer and self._observer.is_alive() else 'down'}>"
+        status = "alive" if self._observer and self._observer.is_alive() else "down"
+        return f"<PipelineWatcher path={self.path} observer={status}>"

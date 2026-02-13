@@ -1,5 +1,4 @@
-"""
-Edge Case Test Script for aw-watcher-pipeline-stage.
+"""Edge Case Test Script for aw-watcher-pipeline-stage.
 
 Verifies Directive 5 Requirements:
 1. Initial Missing File: Warning + Wait.
@@ -7,6 +6,8 @@ Verifies Directive 5 Requirements:
 3. File Deletion: Log WARNING, pause heartbeats, continue watching.
 4. Recovery: Resume on valid write/recreation.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -19,7 +20,11 @@ from aw_watcher_pipeline_stage.client import MockActivityWatchClient, PipelineCl
 from aw_watcher_pipeline_stage.watcher import PipelineWatcher
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format="[TEST] %(message)s")
+LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(name)s: %(message)s'
+LOG_DATE_FORMAT = '%Y-%m-%dT%H:%M:%S'
+logging.basicConfig(
+    level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT
+)
 logger = logging.getLogger("test_edge_cases")
 
 TEST_DIR = Path("./test_env_edge")

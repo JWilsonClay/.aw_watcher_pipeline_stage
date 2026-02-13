@@ -4,6 +4,8 @@ import json
 import logging
 import random
 import shutil
+import os
+import pathlib
 import stat
 import string
 import threading
@@ -14,7 +16,8 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
-from watchdog.events import FileMovedEvent
+from watchdog.events import FileMovedEvent, FileSystemEvent
+import watchdog.observers.polling
 
 from aw_watcher_pipeline_stage.watcher import (
     MAX_FILE_SIZE_BYTES,
@@ -804,6 +807,27 @@ def test_file_moved_to(pipeline_client: PipelineClient, temp_dir: Path) -> None:
         mock_timer.assert_called_once()
         mock_timer.return_value.start.assert_called_once()
 
+def test_watcher_warns_on_polling_observer(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that the watcher logs a warning if PollingObserver is used."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        # Mock observer to be PollingObserver
+        mock_observer = MagicMock(spec=watchdog.observers.polling.PollingObserver)
+        mock_observer.is_alive.return_value = True
+        mock_observer_cls.return_value = mock_observer
+        
+        watcher = PipelineWatcher(f, pipeline_client, pulsetime=120.0)
+        
+        with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+            watcher.start()
+            
+            # Should verify warning
+            assert any("Watchdog fell back to PollingObserver" in str(c) for c in mock_logger.warning.call_args_list)
+            
+        watcher.stop()
+
 
 def test_parse_file_wrapper_execution(pipeline_client: PipelineClient, temp_dir: Path) -> None:
     """Test that the wrapper correctly resets debounce counters and calls parse."""
@@ -1295,12 +1319,30 @@ def test_watcher_is_event_driven(pipeline_client: PipelineClient, temp_dir: Path
 
     mock_observer.assert_called_once()
     observer_instance = mock_observer.return_value
-    observer_instance.schedule.assert_called()
+    # Verify scheduling on directory (temp_dir), not file (f)
+    observer_instance.schedule.assert_called_with(watcher.handler, str(temp_dir), recursive=False)
     observer_instance.start.assert_called_once()
 
     watcher.stop()
     observer_instance.stop.assert_called_once()
     observer_instance.join.assert_called_once()
+
+
+def test_watcher_directory_scheduling_explicit(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that Observer is scheduled on the directory, not the file."""
+    f = temp_dir / "subdir" / "target.json"
+    (temp_dir / "subdir").mkdir()
+    f.touch()
+
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        watcher = PipelineWatcher(f, pipeline_client, pulsetime=120.0)
+        watcher.start()
+        
+        observer_instance = mock_observer_cls.return_value
+        # Should watch the directory containing the file
+        observer_instance.schedule.assert_called_with(watcher.handler, str(f.parent), recursive=False)
+        
+        watcher.stop()
 
 
 def test_debounce_flapping_updates(
@@ -1664,7 +1706,7 @@ def test_observer_schedule_failure_recovery(pipeline_client: PipelineClient, tem
 
 
 def test_observer_persistent_failure(pipeline_client: PipelineClient, temp_dir: Path) -> None:
-    """Test that observer gives up after max retries."""
+    """Test that observer gives up after max retries (verifies failure when fallback also fails)."""
     f = temp_dir / "current_task.json"
     f.touch()
 
@@ -1675,17 +1717,26 @@ def test_observer_persistent_failure(pipeline_client: PipelineClient, temp_dir: 
         
         mock_observer_cls.return_value = obs
         
-        watcher = PipelineWatcher(f, pipeline_client, pulsetime=120.0)
-        
-        with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
-            with patch("time.sleep"):
-                with pytest.raises(RuntimeError, match="Failed to start watchdog observer"):
-                    watcher.start()
+        # Mock PollingObserver to also fail
+        with patch("watchdog.observers.polling.PollingObserver") as mock_polling_cls:
+            mock_polling = MagicMock()
+            mock_polling.start.side_effect = OSError("Polling Fail")
+            mock_polling.is_alive.return_value = False
+            mock_polling_cls.return_value = mock_polling
+
+            watcher = PipelineWatcher(f, pipeline_client, pulsetime=120.0)
             
-            # Should have logged final error
-            assert any("Could not start observer" in str(c) for c in mock_logger.critical.call_args_list)
-            # Should have retried max times (3)
-            assert obs.start.call_count == 3
+            with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+                with patch("time.sleep"):
+                    with pytest.raises(RuntimeError, match="Failed to start watchdog observer"):
+                        watcher.start()
+                
+                # Should have logged final error
+                assert any("Could not start observer" in str(c) for c in mock_logger.critical.call_args_list)
+                # Should have retried max times (3)
+                assert obs.start.call_count == 3
+                # Should have tried polling observer
+                assert mock_polling.start.call_count == 1
 
 
 def test_observer_restart_failure_recovery(pipeline_client: PipelineClient, temp_dir: Path) -> None:
@@ -3812,11 +3863,11 @@ def test_watcher_path_heuristic(pipeline_client: PipelineClient, temp_dir: Path)
     assert w1.watch_dir == temp_dir
     assert w1.handler.target_file == p1
 
-    # Case 2: Non-existent dir (no suffix)
-    p2 = temp_dir / "missing_dir"
+    # Case 2: Non-existent path (no suffix) -> Now treated as file
+    p2 = temp_dir / "missing_file_no_ext"
     w2 = PipelineWatcher(p2, pipeline_client, 120.0)
-    assert w2.watch_dir == p2
-    assert w2.handler.target_file == p2 / "current_task.json"
+    assert w2.watch_dir == temp_dir
+    assert w2.handler.target_file == p2
 
 
 def test_read_error_log_throttling(pipeline_client: PipelineClient, temp_dir: Path) -> None:
@@ -5624,3 +5675,719 @@ def test_read_file_data_caching(pipeline_client: PipelineClient, temp_dir: Path)
         data3 = handler._read_file_data(str(f))
         assert data3 == {"key": "val2"}
         mock_open.assert_called_once()
+
+def test_watcher_schedules_on_parent_for_missing_file(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that watcher schedules on parent directory for a missing file (waiting for creation)."""
+    # File does not exist, but parent does
+    f = temp_dir / "missing.json"
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        watcher = PipelineWatcher(f, pipeline_client, pulsetime=120.0)
+        watcher.start()
+        
+        observer_instance = mock_observer_cls.return_value
+        # Should watch temp_dir (parent of f)
+        observer_instance.schedule.assert_called_with(watcher.handler, str(temp_dir), recursive=False)
+        
+        watcher.stop()
+
+def test_handler_event_types_smoke_test(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Smoke test to ensure handler accepts all watchdog event types without error."""
+    f = temp_dir / "target.json"
+    f.touch()
+    handler = PipelineEventHandler(f, pipeline_client, 120.0)
+    
+    # Created
+    event_created = MagicMock(spec=FileSystemEvent)
+    event_created.is_directory = False
+    event_created.src_path = str(f)
+    event_created.event_type = "created"
+    handler.on_created(event_created)
+    
+    # Modified
+    event_mod = MagicMock(spec=FileSystemEvent)
+    event_mod.is_directory = False
+    event_mod.src_path = str(f)
+    event_mod.event_type = "modified"
+    handler.on_modified(event_mod)
+    
+    # Deleted
+    event_del = MagicMock(spec=FileSystemEvent)
+    event_del.is_directory = False
+    event_del.src_path = str(f)
+    event_del.event_type = "deleted"
+    handler.on_deleted(event_del)
+    
+    # Moved
+    event_moved = MagicMock(spec=FileMovedEvent)
+    event_moved.is_directory = False
+    event_moved.src_path = str(f)
+    event_moved.dest_path = str(temp_dir / "other.json")
+    event_moved.event_type = "moved"
+    handler.on_moved(event_moved)
+
+def test_watcher_directory_determination(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that watch_dir is correctly determined as the parent directory."""
+    # Case 1: Existing file
+    f = temp_dir / "existing.json"
+    f.touch()
+    w1 = PipelineWatcher(f, pipeline_client, 120.0)
+    assert w1.watch_dir == temp_dir.absolute()
+    
+    # Case 2: Non-existent file (heuristic)
+    f2 = temp_dir / "missing.json"
+    w2 = PipelineWatcher(f2, pipeline_client, 120.0)
+    assert w2.watch_dir == temp_dir.absolute()
+    
+    # Case 3: Directory
+    d = temp_dir / "subdir"
+    d.mkdir()
+    w3 = PipelineWatcher(d, pipeline_client, 120.0)
+    assert w3.watch_dir == d.absolute()
+
+def test_observer_schedule_recursive_false(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that the observer is scheduled with recursive=False."""
+    f = temp_dir / "target.json"
+    f.touch()
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        watcher = PipelineWatcher(f, pipeline_client, 120.0)
+        watcher.start()
+        
+        observer = mock_observer_cls.return_value
+        # Verify recursive=False
+        args, kwargs = observer.schedule.call_args
+        assert kwargs.get("recursive") is False
+        
+        watcher.stop()
+
+
+def test_observer_setup_correctness(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """
+    Final Integration Review: Verify Observer setup correctness.
+    - Schedules on directory (not file).
+    - recursive=False.
+    - Uses watchdog.observers.Observer.
+    """
+    target_file = temp_dir / "target.json"
+    target_file.touch()
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        watcher = PipelineWatcher(target_file, pipeline_client, pulsetime=120.0)
+        watcher.start()
+        
+        observer = mock_observer_cls.return_value
+        
+        # Verify schedule called
+        observer.schedule.assert_called_once()
+        args, kwargs = observer.schedule.call_args
+        
+        # Check path is directory
+        watched_path = args[1]
+        assert watched_path == str(target_file.parent)
+        assert Path(watched_path).is_dir()
+        assert watched_path != str(target_file)  # Explicitly ensure not watching file
+        
+        # Check recursive=False
+        assert kwargs.get("recursive") is False
+        
+        watcher.stop()
+
+
+def test_watcher_dispatches_events(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that PipelineWatcher's handler correctly routes watchdog events."""
+    f = temp_dir / "target.json"
+    f.touch()
+    watcher = PipelineWatcher(f, pipeline_client, 120.0)
+    
+    # Mock _process_event to verify routing for created/modified
+    with patch.object(watcher.handler, "_process_event") as mock_process:
+        # Created
+        event = MagicMock(spec=FileSystemEvent)
+        event.event_type = "created"
+        watcher.handler.on_created(event)
+        mock_process.assert_called_with(event)
+        
+        # Modified
+        mock_process.reset_mock()
+        event.event_type = "modified"
+        watcher.handler.on_modified(event)
+        mock_process.assert_called_with(event)
+
+    # For deleted/moved, we verify they trigger state changes or process event
+    with patch.object(watcher.handler, "on_state_changed") as mock_state_change:
+        # Deleted (Target file)
+        event_del = MagicMock(spec=FileSystemEvent)
+        event_del.is_directory = False
+        event_del.src_path = str(f)
+        event_del.event_type = "deleted"
+        
+        watcher.handler.on_deleted(event_del)
+        # Should trigger pause state change
+        mock_state_change.assert_called()
+        assert watcher.handler.is_paused
+
+        # Moved (To Target)
+        mock_state_change.reset_mock()
+        event_moved = MagicMock(spec=FileMovedEvent)
+        event_moved.is_directory = False
+        event_moved.src_path = str(temp_dir / "other.json")
+        event_moved.dest_path = str(f)
+        event_moved.event_type = "moved"
+        
+        with patch.object(watcher.handler, "_process_event") as mock_process:
+            watcher.handler.on_moved(event_moved)
+            mock_process.assert_called_with(event_moved)
+
+
+def test_platform_specific_initialization(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test watcher initialization on different platforms (mocked)."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+    
+    # Test Windows
+    with patch("sys.platform", "win32"):
+        watcher = PipelineWatcher(f, pipeline_client)
+        assert watcher.path == f.absolute()
+        assert watcher.watch_dir == f.parent.absolute()
+        
+    # Test macOS
+    with patch("sys.platform", "darwin"):
+        watcher = PipelineWatcher(f, pipeline_client)
+        assert watcher.path == f.absolute()
+        assert watcher.watch_dir == f.parent.absolute()
+
+
+def test_observer_schedule_directory_structure(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """
+    Verify Observer scheduling for both file and directory inputs.
+    Ensures we watch the directory to handle file recreation/deletion reliably.
+    """
+    # Case 1: File input
+    f = temp_dir / "file.json"
+    f.touch()
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        watcher = PipelineWatcher(f, pipeline_client, 120.0)
+        watcher.start()
+        
+        observer = mock_observer_cls.return_value
+        args, kwargs = observer.schedule.call_args
+        # Should watch parent directory
+        assert args[1] == str(f.parent)
+        assert kwargs.get("recursive") is False
+        watcher.stop()
+        
+    # Case 2: Directory input
+    d = temp_dir / "dir"
+    d.mkdir()
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        watcher = PipelineWatcher(d, pipeline_client, 120.0)
+        watcher.start()
+        
+        observer = mock_observer_cls.return_value
+        args, kwargs = observer.schedule.call_args
+        # Should watch the directory itself
+        assert args[1] == str(d)
+        assert kwargs.get("recursive") is False
+        watcher.stop()
+
+def test_watcher_expanduser(pipeline_client: PipelineClient) -> None:
+    """Test that ~ in path is expanded."""
+    # Mock Path.expanduser
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("/home/user/expanded")
+        
+        watcher = PipelineWatcher("~/test.json", pipeline_client, 120.0)
+        
+        mock_expand.assert_called()
+        assert str(watcher.path).startswith(str(Path("/home/user/expanded").absolute()))
+
+def test_watcher_expanduser_path_object(pipeline_client: PipelineClient) -> None:
+    """Test that ~ in Path object is expanded."""
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("/home/user/expanded")
+        
+        watcher = PipelineWatcher(Path("~/test.json"), pipeline_client, 120.0)
+        
+        mock_expand.assert_called()
+        assert str(watcher.path).startswith(str(Path("/home/user/expanded").absolute()))
+
+def test_observer_fallback_to_polling_on_oserror(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test fallback to PollingObserver if native Observer raises OSError."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        # Native observer fails with OSError
+        mock_observer_cls.side_effect = OSError("Inotify limit")
+        
+        with patch("watchdog.observers.polling.PollingObserver") as mock_polling_cls:
+            mock_polling = mock_polling_cls.return_value
+            mock_polling.is_alive.return_value = True
+            
+            watcher = PipelineWatcher(f, pipeline_client, 120.0)
+            
+            with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+                with patch("time.sleep"):
+                    watcher.start()
+                
+                # Should have tried native observer max_retries times
+                assert mock_observer_cls.call_count == 3
+                
+                # Should have logged warning about fallback
+                assert any("Falling back to PollingObserver" in str(c) for c in mock_logger.warning.call_args_list)
+                
+                # Should have started polling observer
+                mock_polling_cls.assert_called_once()
+                mock_polling.start.assert_called_once()
+                
+                assert watcher.observer is mock_polling
+            
+            watcher.stop()
+
+
+def test_handler_expanduser(pipeline_client: PipelineClient) -> None:
+    """Test that PipelineEventHandler expands ~ in path."""
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("/home/user/expanded")
+        
+        # Pass a path that needs expansion
+        path = Path("~/test.json")
+        handler = PipelineEventHandler(path, pipeline_client, 120.0)
+        
+        mock_expand.assert_called()
+        assert str(handler.watch_path).startswith(str(Path("/home/user/expanded").absolute()))
+
+
+def test_observer_schedule_failure_fallback_to_polling(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test fallback to PollingObserver if native Observer.schedule raises OSError."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+    
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        # Native observer succeeds init, but fails schedule
+        native_obs = MagicMock()
+        native_obs.schedule.side_effect = OSError("Inotify limit")
+        # is_alive is False because start() hasn't been called successfully
+        native_obs.is_alive.return_value = False
+        
+        mock_observer_cls.return_value = native_obs
+        
+        with patch("watchdog.observers.polling.PollingObserver") as mock_polling_cls:
+            mock_polling = mock_polling_cls.return_value
+            mock_polling.is_alive.return_value = True
+            
+            watcher = PipelineWatcher(f, pipeline_client, 120.0)
+            
+            with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+                with patch("time.sleep"):
+                    watcher.start()
+                
+                # Should have tried native observer max_retries times (3)
+                assert mock_observer_cls.call_count == 3
+                assert native_obs.schedule.call_count == 3
+                
+                # Should have logged warning about fallback
+                assert any("Falling back to PollingObserver" in str(c) for c in mock_logger.warning.call_args_list)
+                
+                # Should have started polling observer
+                mock_polling_cls.assert_called_once()
+                mock_polling.start.assert_called_once()
+                
+                assert watcher.observer is mock_polling
+            
+            watcher.stop()
+
+
+def test_watcher_expanduser_failure_fallback(pipeline_client: PipelineClient) -> None:
+    """Test fallback when expanduser fails (e.g. no home directory)."""
+    with patch("pathlib.Path.expanduser", side_effect=RuntimeError("No home")):
+        with patch("pathlib.Path.absolute") as mock_abs:
+            mock_abs.return_value = Path("/abs/path")
+            
+            watcher = PipelineWatcher("test.json", pipeline_client, 120.0)
+            
+            assert watcher.path == Path("/abs/path")
+
+
+def test_expanduser_on_windows(pipeline_client: PipelineClient) -> None:
+    """Test that expanduser is called even when platform is win32."""
+    with patch("sys.platform", "win32"):
+        with patch("pathlib.Path.expanduser") as mock_expand:
+            # Mock return value to simulate Windows expansion
+            mock_expand.return_value = Path("C:/Users/User/test.json")
+            
+            watcher = PipelineWatcher("~\\test.json", pipeline_client, 120.0)
+            
+            mock_expand.assert_called()
+            # Verify it uses the expanded path (converted to absolute)
+            assert str(watcher.path) == str(Path("C:/Users/User/test.json").absolute())
+
+
+def test_observer_fallback_to_polling_on_generic_exception(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test fallback to PollingObserver if native Observer raises a generic Exception."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+
+    with patch("aw_watcher_pipeline_stage.watcher.Observer") as mock_observer_cls:
+        # Native observer fails with generic Exception (e.g. platform specific runtime error)
+        mock_observer_cls.side_effect = Exception("Unknown platform error")
+
+        with patch("watchdog.observers.polling.PollingObserver") as mock_polling_cls:
+            mock_polling = mock_polling_cls.return_value
+            mock_polling.is_alive.return_value = True
+
+            watcher = PipelineWatcher(f, pipeline_client, 120.0)
+
+            with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+                with patch("time.sleep"):
+                    watcher.start()
+
+                # Should have tried native observer max_retries times
+                assert mock_observer_cls.call_count == 3
+
+                # Should have logged warning about fallback
+                assert any("Falling back to PollingObserver" in str(c) for c in mock_logger.warning.call_args_list)
+
+                # Should have started polling observer
+                mock_polling_cls.assert_called_once()
+                mock_polling.start.assert_called_once()
+
+                assert watcher.observer is mock_polling
+
+            watcher.stop()
+
+
+def test_observer_fallback_logging_platform_info(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that fallback log includes platform info."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+
+    with patch("aw_watcher_pipeline_stage.watcher.Observer", side_effect=OSError("Fail")):
+        with patch("watchdog.observers.polling.PollingObserver"):
+            with patch("sys.platform", "custom_os"):
+                watcher = PipelineWatcher(f, pipeline_client, debounce_seconds=1.0)
+                with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+                    with patch("time.sleep"):
+                        watcher.start()
+
+                    assert any("on custom_os" in str(c) for c in mock_logger.warning.call_args_list)
+                watcher.stop()
+
+
+def test_observer_fallback_on_specific_platforms(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test observer fallback logging on specific platforms (win32, darwin, linux)."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+
+    for platform in ["win32", "darwin", "linux"]:
+        with patch("sys.platform", platform):
+            with patch("aw_watcher_pipeline_stage.watcher.Observer", side_effect=OSError("Native fail")):
+                with patch("watchdog.observers.polling.PollingObserver") as mock_polling:
+                    mock_polling.return_value.is_alive.return_value = True
+
+                    watcher = PipelineWatcher(f, pipeline_client, 120.0)
+
+                    with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+                        with patch("time.sleep"):
+                            watcher.start()
+
+                        # Verify log contains platform name
+                        assert any(f"on {platform}" in str(c) for c in mock_logger.warning.call_args_list)
+                        assert any("Falling back to PollingObserver" in str(c) for c in mock_logger.warning.call_args_list)
+
+                    watcher.stop()
+
+
+def test_config_validate_path_expanduser_fallback(temp_dir: Path) -> None:
+    """Test that _validate_path falls back if expanduser fails."""
+    from aw_watcher_pipeline_stage.config import _validate_path
+
+    f = temp_dir / "test.json"
+    f.touch()
+
+    with patch("pathlib.Path.expanduser", side_effect=RuntimeError("No home")):
+        # Should not raise
+        path = _validate_path(str(f))
+        assert path == str(f.absolute())
+
+
+def test_config_paths_windows_appdata() -> None:
+    """Test config path resolution on Windows using APPDATA."""
+    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+    
+    # Mock os.name to 'nt' to trigger Windows logic
+    with patch("os.name", "nt"):
+        # Mock APPDATA environment variable
+        with patch.dict(os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=True):
+            paths = _get_config_file_paths()
+            # Construct expected path using current OS's Path to match behavior
+            base = Path(r"C:\Users\Test\AppData\Roaming").expanduser()
+            expected = str(base / "aw-watcher-pipeline-stage" / "config.ini")
+            assert expected in paths
+
+
+def test_config_paths_linux_xdg() -> None:
+    """Test config path resolution on Linux using XDG_CONFIG_HOME."""
+    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+    
+    with patch("os.name", "posix"):
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/tmp/config"}, clear=True):
+            paths = _get_config_file_paths()
+            expected = str(Path("/tmp/config/aw-watcher-pipeline-stage/config.ini"))
+            assert expected in paths
+
+
+def test_config_paths_fallback() -> None:
+    """Test config path fallback to ~/.config."""
+    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+    
+    with patch("os.name", "posix"):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("pathlib.Path.home", return_value=Path("/home/fallback")):
+                paths = _get_config_file_paths()
+                expected = str(Path("/home/fallback/.config/aw-watcher-pipeline-stage/config.ini"))
+                assert expected in paths
+
+
+def test_config_validate_path_windows_expanduser() -> None:
+    """Test that _validate_path expands ~ on Windows."""
+    from aw_watcher_pipeline_stage.config import _validate_path
+
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("C:/Users/User/test.json")
+
+        with patch("pathlib.Path.resolve") as mock_resolve:
+            mock_resolve.return_value = Path("C:/Users/User/test.json")
+
+            with patch("pathlib.Path.exists", return_value=True):
+                with patch("pathlib.Path.is_file", return_value=True):
+                    with patch("pathlib.Path.open"):
+                        path = _validate_path("~\\test.json")
+                        mock_expand.assert_called()
+                        assert path == str(Path("C:/Users/User/test.json"))
+
+
+def test_load_config_expanduser_integration() -> None:
+    """Test that load_config expands ~ in watch_path via CLI args."""
+    from aw_watcher_pipeline_stage.config import load_config
+
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("/home/user/expanded")
+
+        with patch("pathlib.Path.resolve") as mock_resolve:
+            mock_resolve.return_value = Path("/home/user/expanded")
+
+            with patch("pathlib.Path.exists", return_value=True):
+                with patch("pathlib.Path.is_file", return_value=True):
+                    with patch("pathlib.Path.open"):
+                        args = {"watch_path": "~/test.json"}
+                        config = load_config(args)
+
+                        assert config.watch_path == str(Path("/home/user/expanded"))
+
+
+def test_polling_observer_warning(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that a warning is logged when falling back to PollingObserver."""
+    f = temp_dir / "current_task.json"
+    f.touch()
+
+    with patch("aw_watcher_pipeline_stage.watcher.Observer", side_effect=OSError("Fail")):
+        with patch("watchdog.observers.polling.PollingObserver") as mock_polling:
+            mock_polling.return_value.is_alive.return_value = True
+
+            watcher = PipelineWatcher(f, pipeline_client, 120.0)
+
+            with patch("aw_watcher_pipeline_stage.watcher.logger") as mock_logger:
+                with patch("time.sleep"):
+                    watcher.start()
+
+                assert any("PollingObserver is active" in str(c) for c in mock_logger.warning.call_args_list)
+
+            watcher.stop()
+
+
+def test_config_paths_home_failure() -> None:
+    """Test config path resolution when Path.home() fails."""
+    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+
+    with patch("os.name", "posix"):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("pathlib.Path.home", side_effect=RuntimeError("No home")):
+                paths = _get_config_file_paths()
+                # Should return just local config.ini
+                assert paths == ["config.ini"]
+
+
+def test_config_log_file_windows_expanduser() -> None:
+    """Test that _validate_path expands ~ for log files on Windows."""
+    from aw_watcher_pipeline_stage.config import _validate_path
+
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("C:/Users/User/app.log")
+
+        with patch("pathlib.Path.resolve") as mock_resolve:
+            mock_resolve.return_value = Path("C:/Users/User/app.log")
+
+            # Mock existence checks for log file validation logic
+            with patch("pathlib.Path.exists", return_value=False):
+                with patch("pathlib.Path.open"):
+                    path = _validate_path("~\\app.log", is_log=True)
+                    mock_expand.assert_called()
+                    assert path == str(Path("C:/Users/User/app.log"))
+
+
+def test_watcher_expanduser_home_only(pipeline_client: PipelineClient) -> None:
+    """Test that watch_path='~' is expanded to user home."""
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("/home/user")
+
+        watcher = PipelineWatcher("~", pipeline_client, 120.0)
+
+        mock_expand.assert_called()
+        assert str(watcher.path) == str(Path("/home/user").absolute())
+
+
+def test_config_validate_path_linux_expanduser() -> None:
+    """Test that _validate_path expands ~ on Linux."""
+    from aw_watcher_pipeline_stage.config import _validate_path
+
+    with patch("pathlib.Path.expanduser") as mock_expand:
+        mock_expand.return_value = Path("/home/user/test.json")
+
+        with patch("pathlib.Path.resolve") as mock_resolve:
+            mock_resolve.return_value = Path("/home/user/test.json")
+
+            with patch("pathlib.Path.exists", return_value=True):
+                with patch("pathlib.Path.is_file", return_value=True):
+                    with patch("pathlib.Path.open"):
+                        path = _validate_path("~/test.json")
+                        mock_expand.assert_called()
+                        assert path == str(Path("/home/user/test.json"))
+
+
+def test_resource_usage_macos_units() -> None:
+    """Test that resource usage handles macOS bytes vs Linux KB for RSS."""
+    with patch("aw_watcher_pipeline_stage.main.resource") as mock_resource:
+        with patch("aw_watcher_pipeline_stage.main.logger") as mock_logger:
+            import aw_watcher_pipeline_stage.main as main_mod
+
+            # Setup mock
+            mock_usage = MagicMock()
+            mock_usage.ru_utime = 10.0
+            mock_usage.ru_stime = 5.0
+            mock_resource.getrusage.return_value = mock_usage
+            mock_resource.RUSAGE_SELF = 0
+
+            mock_logger.isEnabledFor.return_value = True
+            main_mod._last_rusage = None
+
+            # Test macOS (bytes)
+            # 50 MB = 50 * 1024 * 1024 bytes
+            mock_usage.ru_maxrss = 50 * 1024 * 1024
+
+            with patch("sys.platform", "darwin"):
+                with patch("time.monotonic", return_value=1000.0):
+                    main_mod.log_resource_usage()
+
+                    # Should calculate 50MB correctly
+                    args = mock_logger.info.call_args[0][0]
+                    assert "Max RSS=50.00MB" in args
+
+            # Test Linux (KB)
+            # 50 MB = 50 * 1024 KB
+            mock_usage.ru_maxrss = 50 * 1024
+
+            with patch("sys.platform", "linux"):
+                with patch("time.monotonic", return_value=1000.0):
+                    main_mod.log_resource_usage()
+
+                    args = mock_logger.info.call_args[0][0]
+                    assert "Max RSS=50.00MB" in args
+
+
+def test_process_event_path_casing_mismatch(pipeline_client: PipelineClient, temp_dir: Path) -> None:
+    """Test that event processing handles case mismatches (simulated)."""
+    f = temp_dir / "Target.json"
+    f.touch()
+
+    watcher = PipelineWatcher(f, pipeline_client, 120.0)
+
+    # Simulate an event with different casing string
+    event_path_str = str(f).upper()
+    if event_path_str == str(f):
+        event_path_str = str(f).lower()
+
+    event = MagicMock()
+    event.is_directory = False
+    event.src_path = event_path_str
+
+    # Force the handler's target_file to match the event path's absolute path
+    # This simulates the OS resolving them to the same file object/path
+    watcher.handler.target_file = Path(event_path_str).absolute()
+
+    with patch.object(watcher.handler, "_read_file_data") as mock_read:
+        watcher.handler._process_event(event)
+        mock_read.assert_called()
+
+
+def test_config_paths_windows_no_appdata() -> None:
+    """Test config path resolution on Windows when APPDATA is missing (fallback)."""
+    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+    
+    with patch("os.name", "nt"):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("pathlib.Path.home", return_value=Path("C:/Users/Test")):
+                paths = _get_config_file_paths()
+                # Should fall back to ~/.config logic
+                expected = str(Path("C:/Users/Test/.config/aw-watcher-pipeline-stage/config.ini"))
+                assert expected in paths
+
+
+def test_watcher_init_backslash_path(pipeline_client: PipelineClient) -> None:
+    """Test watcher initialization with backslash path (sanity check)."""
+    # On Linux this is a valid filename, on Windows a separator.
+    # Just ensure it doesn't crash.
+    p = "path\\to\\file.json"
+    watcher = PipelineWatcher(p, pipeline_client, 120.0)
+    assert watcher.path
+
+
+def test_mixed_separators_path(pipeline_client: PipelineClient) -> None:
+    """Test watcher initialization with mixed separators (sanity check)."""
+    # On Windows, / and \ are both separators. On Linux, \ is a char.
+    # This test ensures pathlib doesn't crash.
+    p = "path/to\\file.json"
+    watcher = PipelineWatcher(p, pipeline_client, 120.0)
+    assert watcher.path
+
+
+def test_config_xdg_home_expanduser() -> None:
+    """Test that XDG_CONFIG_HOME with ~ is expanded."""
+    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": "~/custom_config"}):
+        with patch("pathlib.Path.expanduser") as mock_expand:
+            mock_expand.return_value = Path("/home/user/custom_config")
+
+            paths = _get_config_file_paths()
+
+            expected = str(Path("/home/user/custom_config/aw-watcher-pipeline-stage/config.ini"))
+            assert expected in paths
+
+
+def test_config_appdata_expanduser() -> None:
+    """Test that APPDATA with ~ is expanded on Windows."""
+    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+
+    with patch("os.name", "nt"):
+        with patch.dict(os.environ, {"APPDATA": "~/AppData/Roaming"}):
+            with patch("pathlib.Path.expanduser") as mock_expand:
+                mock_expand.return_value = Path("C:/Users/User/AppData/Roaming")
+
+                paths = _get_config_file_paths()
+
+                expected = str(Path("C:/Users/User/AppData/Roaming/aw-watcher-pipeline-stage/config.ini"))
+                assert expected in paths

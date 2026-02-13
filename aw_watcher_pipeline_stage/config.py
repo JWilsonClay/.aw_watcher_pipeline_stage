@@ -11,10 +11,12 @@ Priority Order:
     1. CLI Arguments
     2. Environment Variables
     3. Config File
+       * `config.ini`
     4. Defaults
 
 Supported Environment Variables:
-    * ``AW_WATCHER_WATCH_PATH`` / ``PIPELINE_WATCHER_PATH``: Path to the file to watch.
+    * ``AW_WATCHER_WATCH_PATH`` / ``PIPELINE_WATCHER_PATH``: Path to the file to
+      watch.
     * ``AW_WATCHER_PORT``: Port for the ActivityWatch server.
     * ``AW_WATCHER_TESTING``: Enable testing mode.
     * ``AW_WATCHER_LOG_FILE``: Path to the log file.
@@ -81,6 +83,7 @@ def _find_project_root(start_path: Path) -> Optional[Path]:
 
     Traverses parents of the start path looking for a `.git` directory.
     Catches OSError during traversal to ensure robustness.
+    Uses Path.iterdir() to detect .git (works for both directory and file).
 
     This is primarily used to determine a default watch path if none is provided.
 
@@ -92,17 +95,23 @@ def _find_project_root(start_path: Path) -> Optional[Path]:
         Optional[Path]: The path to the project root if found, else None.
     """
     try:
-        path = start_path.resolve()
+        # Resolve strictly to catch errors early
+        path = start_path.resolve(strict=True)
+        # If start_path is a file, start search from its parent directory
         if path.is_file():
             path = path.parent
 
         for parent in [path] + list(path.parents):
-            # Check for .git, catching potential permission errors via the outer try/except
-            if (parent / ".git").exists():
-                return parent
-    except OSError:
+            # Check for .git using iterdir for robustness (handles both dir and file)
+            try:
+                if any(child.name == ".git" for child in parent.iterdir()):
+                    return parent
+            except (OSError, PermissionError):
+                continue
+    except (OSError, RuntimeError):
         pass
     return None
+
 
 def _get_config_file_paths() -> List[str]:
     """Return a list of potential config file paths in order of priority.
@@ -116,44 +125,51 @@ def _get_config_file_paths() -> List[str]:
     Returns:
         List[str]: A list of file paths to check for configuration.
     """
-    paths = ["config.ini"]  # Local directory (highest priority among files)
+    paths = []
+
+    # Local directory (highest priority among files)
+    paths.append("config.ini")
 
     xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    appdata = os.environ.get("APPDATA")
+
     if xdg_config_home:
-        paths.append(
-            os.path.join(
-                os.path.expanduser(xdg_config_home),
-                "aw-watcher-pipeline-stage",
-                "config.ini",
-            )
-        )
-    elif os.name == "nt" and os.environ.get("APPDATA"):
-        paths.append(
-            os.path.join(
-                os.path.expanduser(os.environ["APPDATA"]),
-                "aw-watcher-pipeline-stage",
-                "config.ini",
-            )
-        )
+        app_config_dir = Path(xdg_config_home).expanduser() / "aw-watcher-pipeline-stage"
+        paths.append(str(app_config_dir / "config.ini"))
+    elif os.name == "nt" and appdata:
+        # Windows: Use APPDATA for configuration
+        # Pathlib handles the backslashes correctly
+        app_config_dir = Path(appdata).expanduser() / "aw-watcher-pipeline-stage"
+        paths.append(str(app_config_dir / "config.ini"))
     else:
-        # Fallback for POSIX (macOS/Linux) and Windows without APPDATA
-        paths.append(
-            os.path.join(
-                os.path.expanduser("~"),
-                ".config",
-                "aw-watcher-pipeline-stage",
-                "config.ini",
-            )
-        )
-    return paths
+        # Fallback for POSIX (macOS/Linux) and Windows without APPDATA/XDG_CONFIG_HOME
+        try:
+            app_config_dir = Path.home() / ".config" / "aw-watcher-pipeline-stage"
+            paths.append(str(app_config_dir / "config.ini"))
+        except (RuntimeError, OSError):
+            pass
+
+    # Filter out duplicates and ensure order
+    # This is important because Path("~").expanduser() might resolve to the same
+    # base_dir
+    # as XDG_CONFIG_HOME if XDG_CONFIG_HOME is set to "~/.config"
+    # or if APPDATA is set to a path that contains ~/.config.
+    seen = set()
+    unique_paths = []
+    for p in paths:
+        if p not in seen:
+            unique_paths.append(p)
+            seen.add(p)
+    return unique_paths
+
 
 def _validate_path(path_str: str, is_log: bool = False) -> str:
     """Resolve and validate path security, expanding the user tilde.
 
-    Performs strict resolution to canonicalize paths, preventing directory traversal
-    and ensuring the path points to a valid location. Checks for regular file type
-    (rejecting directories/devices for file paths) and verifies read/write permissions.
-    Expands user tilde (~) to the user's home directory.
+    Performs strict resolution to canonicalize paths (using Path.resolve(strict=True)),
+    preventing directory traversal (removing '..') and ensuring the path points to a valid location (Cross-Platform).
+    Checks for regular file type (rejecting directories/devices for file paths) and verifies
+    read/write permissions. Expands user tilde (~) to the user's home directory.
 
     If `path_str` points to a directory and `is_log` is False, the function automatically
     appends 'current_task.json' to the path.
@@ -179,13 +195,21 @@ def _validate_path(path_str: str, is_log: bool = False) -> str:
             is not a regular file, or lacks required permissions.
     """
     try:
-        path = Path(os.path.expanduser(path_str))
+        try:
+            path = Path(path_str).expanduser()
+        except (RuntimeError, OSError):
+            path = Path(path_str)
         
         # Security: Reject symlinks explicitly
         if path.is_symlink():
-            raise ValueError(f"Invalid path: Symlinks are not allowed (security): {path}")
+            raise ValueError(
+                f"Invalid path: Symlinks are not allowed (security): {path}"
+            )
 
         # Resolve strictly to canonical path
+        # This handles traversal risks (e.g. '..') by resolving them to the absolute path
+        # and ensuring the path exists (strict=True).
+        # Cross-Platform: Path.resolve() handles OS-specific separators and symlinks.
         try:
             resolved = path.resolve(strict=True)
         except FileNotFoundError:
@@ -212,7 +236,10 @@ def _validate_path(path_str: str, is_log: bool = False) -> str:
             # Check if it is a regular file (if it exists)
             if resolved.exists():
                 if not resolved.is_file():
-                    raise ValueError(f"Invalid path: Watch path is not a regular file (directories/devices not allowed): {resolved}")
+                    raise ValueError(
+                        "Invalid path: Watch path is not a regular file "
+                        f"(directories/devices not allowed): {resolved}"
+                    )
                 # Check read permission
                 try:
                     with resolved.open('r'):
@@ -246,6 +273,7 @@ def _validate_path(path_str: str, is_log: bool = False) -> str:
         if isinstance(e, ValueError):
             raise
         raise ValueError(f"Path validation failed for '{path_str}': {e}") from e
+
 
 def load_config(args: Dict[str, Any]) -> Config:
     """Load and validate configuration with strict priority, returning a Config object.
@@ -328,22 +356,23 @@ def load_config(args: Dict[str, Any]) -> Config:
         "batch_size_limit": 5,
     }
 
-    # 2. Config File (simple INI support)
+    # 2. Config File (INI support)
     # Check for config file in XDG_CONFIG_HOME or local directory
     for path in _get_config_file_paths():
-        if os.path.isfile(path):
+        if Path(path).is_file():
             logger.debug(f"Loading config from {path}")
+            
+            # INI support
             parser = ConfigParser(interpolation=None)
             try:
                 parser.read(path, encoding="utf-8-sig")
                 if "aw-watcher-pipeline-stage" in parser:
                     for key, value in parser["aw-watcher-pipeline-stage"].items():
-                        # Basic type conversion could go here
                         if value is not None and value != "":
-                            config_values[key] = value
+                            config_values[key.replace("-", "_")] = value
+                break
             except (ConfigParserError, UnicodeDecodeError, OSError) as e:
                 logger.error(f"Failed to parse config file {path}: {e}")
-            break
 
     # 3. Environment Variables
     env_map = {
@@ -357,6 +386,7 @@ def load_config(args: Dict[str, Any]) -> Config:
         "AW_WATCHER_DEBOUNCE_SECONDS": "debounce_seconds",
         "AW_WATCHER_METADATA_ALLOWLIST": "metadata_allowlist",
         "AW_WATCHER_BATCH_SIZE_LIMIT": "batch_size_limit",
+        # Note: batch_size_limit is cast to int in the type casting section below
     }
     for env_var, config_key in env_map.items():
         val = os.getenv(env_var)
@@ -399,9 +429,14 @@ def load_config(args: Dict[str, Any]) -> Config:
         try:
             config_values["batch_size_limit"] = int(config_values["batch_size_limit"])
         except ValueError as e:
-            raise ValueError(f"Invalid integer for batch_size_limit: {config_values['batch_size_limit']}") from e
+            raise ValueError(
+                f"Invalid integer for batch_size_limit: {config_values['batch_size_limit']}"
+            ) from e
         if not (1 <= config_values["batch_size_limit"] <= 1000):
-            raise ValueError(f"batch_size_limit must be between 1 and 1000, got {config_values['batch_size_limit']}")
+            raise ValueError(
+                "batch_size_limit must be between 1 and 1000, "
+                f"got {config_values['batch_size_limit']}"
+            )
 
     if config_values["metadata_allowlist"] is not None:
         if isinstance(config_values["metadata_allowlist"], str):
@@ -414,8 +449,12 @@ def load_config(args: Dict[str, Any]) -> Config:
         elif isinstance(config_values["metadata_allowlist"], list):
             # Ensure all elements are strings (defensive) and strip whitespace
             config_values["metadata_allowlist"] = [
-                str(k).strip() for k in config_values["metadata_allowlist"] if str(k).strip()
+                str(k).strip()
+                for k in config_values["metadata_allowlist"]
+                if str(k).strip()
             ]
+        else:
+            raise ValueError(f"Invalid type for metadata_allowlist: {type(config_values['metadata_allowlist'])}")
 
     # Expand user path for watch_path (e.g. ~)
     if config_values["watch_path"]:
@@ -424,7 +463,7 @@ def load_config(args: Dict[str, Any]) -> Config:
         # Default to git root if available, else "."
         try:
             cwd = Path.cwd()
-            root = _find_project_root(cwd)
+            root = _find_project_root(cwd)  # Only search for git root if needed
         except OSError:
             logger.debug("Could not determine CWD, defaulting watch_path to '.'")
             root = None

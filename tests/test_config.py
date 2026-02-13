@@ -22,7 +22,7 @@ def test_config_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     with patch("aw_watcher_pipeline_stage.config._find_project_root", return_value=None):
         with patch.dict(os.environ, env, clear=True):
             config = load_config({})
-            assert config.watch_path == "."
+            assert Path(config.watch_path) == (tmp_path / "current_task.json").resolve()
             assert config.port == 5600
             assert config.pulsetime == 120.0
             assert config.debounce_seconds == 1.0
@@ -46,14 +46,14 @@ def test_git_root_detection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     with patch.dict(os.environ, env, clear=True):
         config = load_config({})
         # Should resolve to tmp_path (the git root)
-        assert Path(config.watch_path).resolve() == tmp_path.resolve()
+        assert Path(config.watch_path).resolve() == (tmp_path / "current_task.json").resolve()
 
     # Test fallback to "." if no git root
     monkeypatch.chdir(tmp_path / "empty_config") # A dir without .git
     with patch("aw_watcher_pipeline_stage.config._find_project_root", return_value=None):
         with patch.dict(os.environ, env, clear=True):
             config = load_config({})
-            assert config.watch_path == "."
+            assert Path(config.watch_path) == (tmp_path / "empty_config" / "current_task.json").resolve()
 
 def test_nested_git_root_detection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that the closest .git directory is used when nested."""
@@ -77,7 +77,7 @@ def test_nested_git_root_detection(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     with patch.dict(os.environ, {}, clear=True):
         config = load_config({})
         # Should resolve to inner, not outer
-        assert Path(config.watch_path).resolve() == inner.resolve()
+        assert Path(config.watch_path).resolve() == (inner / "current_task.json").resolve()
 
 
 def test_mixed_configuration_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,33 +103,48 @@ def test_mixed_configuration_sources(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_path_resolution_and_expansion(tmp_path: Path) -> None:
-    """Test path resolution, including absolute, relative, and user expansion."""
+    """Test path resolution, including absolute, relative, and user expansion, are resolved."""
+    # Create dummy dirs so validation can find a parent
+    (tmp_path / "absolute").mkdir()
+    (tmp_path / "relative" / "path").mkdir(parents=True)
     
     # Absolute path
-    abs_path = str(tmp_path / "absolute")
+    abs_path = tmp_path / "absolute"
     config = load_config({"watch_path": abs_path})
-    assert config.watch_path == abs_path
+    # Path is resolved and default filename is appended for directories
+    assert Path(config.watch_path) == (abs_path / "current_task.json").resolve()
     
     # Relative path
     rel_path = "relative/path"
     config = load_config({"watch_path": rel_path})
-    assert config.watch_path == rel_path
+    assert Path(config.watch_path) == (tmp_path / rel_path / "current_task.json").resolve()
     
     # User expansion (~)
-    # We mock os.path.expanduser to verify it's called
     with patch("os.path.expanduser") as mock_expand:
-        mock_expand.return_value = "/home/user/expanded"
+        expanded_path = tmp_path / "expanded"
+        expanded_path.mkdir()
+        mock_expand.return_value = str(expanded_path)
+
         config = load_config({"watch_path": "~/expanded"})
         
         mock_expand.assert_called_with("~/expanded")
-        assert config.watch_path == "/home/user/expanded"
+        assert Path(config.watch_path) == (expanded_path / "current_task.json").resolve()
 
 
 def test_windows_path_handling() -> None:
-    """Test that Windows-style paths are preserved in config loading."""
+    """Test that Windows-style paths are correctly passed to the validator."""
     win_path = r"C:\Users\Dev\current_task.json"
-    config = load_config({"watch_path": win_path})
-    assert config.watch_path == win_path
+    
+    # We mock the validation process to simulate running on Windows
+    # where this path would be valid and resolved.
+    with patch("aw_watcher_pipeline_stage.config._validate_path") as mock_validate:
+        # The validator should return the canonical, absolute path.
+        mock_validate.return_value = win_path
+        
+        config = load_config({"watch_path": win_path})
+        
+        mock_validate.assert_called_with(win_path, is_log=False)
+        assert config.watch_path == win_path
 
 
 def test_boolean_conversion() -> None:
@@ -424,14 +439,14 @@ def test_comprehensive_path_resolution_and_priority(tmp_path: Path, monkeypatch:
     config_file.unlink()
     with patch.dict(os.environ, {}, clear=True):
         config = load_config({})
-        assert Path(config.watch_path).resolve() == tmp_path.resolve()
+        assert Path(config.watch_path).resolve() == (tmp_path / "current_task.json").resolve()
 
     # Test 5: CWD wins (Git Root removed)
     (tmp_path / ".git").rmdir()
     with patch("aw_watcher_pipeline_stage.config._find_project_root", return_value=None):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config({})
-            assert config.watch_path == "."
+            assert Path(config.watch_path) == (tmp_path / "current_task.json").resolve()
 
 
 def test_log_file_expansion(tmp_path: Path) -> None:
@@ -457,7 +472,7 @@ def test_empty_watch_path_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPat
             # Pass empty string via CLI args
             config = load_config({"watch_path": ""})
             # Should default to "." (since tmp_path is not git root)
-            assert config.watch_path == "."
+            assert Path(config.watch_path) == (tmp_path / "current_task.json").resolve()
 
 
 def test_extra_config_keys_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -513,17 +528,18 @@ def test_config_file_partial_override(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_windows_path_in_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test that Windows-style paths with backslashes in config file are preserved."""
+    """Test that Windows-style paths with backslashes in config file are handled."""
     monkeypatch.chdir(tmp_path)
     # Note: In INI files, backslashes are generally treated literally by ConfigParser
     # unless using ExtendedInterpolation. We explicitly disable interpolation in config.py.
     win_path = r"C:\Users\Dev\current_task.json"
     
     (tmp_path / "config.ini").write_text(f"[aw-watcher-pipeline-stage]\nwatch_path = {win_path}", encoding="utf-8")
-    
-    with patch.dict(os.environ, {}, clear=True):
-        config = load_config({})
-        assert config.watch_path == win_path
+    with patch("aw_watcher_pipeline_stage.config._validate_path") as mock_validate:
+        mock_validate.return_value = win_path
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config({})
+            assert config.watch_path == win_path
 
 
 def test_config_file_unicode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -650,7 +666,7 @@ def test_default_watch_path_fallback_explicit(tmp_path: Path, monkeypatch: pytes
     with patch("aw_watcher_pipeline_stage.config._find_project_root", return_value=None):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config({})
-            assert config.watch_path == "."
+            assert Path(config.watch_path) == (tmp_path / "current_task.json").resolve()
 
 
 def test_deep_git_root_detection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -665,29 +681,31 @@ def test_deep_git_root_detection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     with patch.dict(os.environ, {}, clear=True):
         config = load_config({})
         # Should resolve to tmp_path (the git root)
-        assert Path(config.watch_path).resolve() == tmp_path.resolve()
+        assert Path(config.watch_path).resolve() == (tmp_path / "current_task.json").resolve()
 
 
 @pytest.mark.parametrize("os_name, env_vars, expected_path_part", [
-    ("posix", {"XDG_CONFIG_HOME": "/tmp/xdg"}, "/tmp/xdg/aw-watcher-pipeline-stage/config.ini"),
-    ("posix", {}, ".config/aw-watcher-pipeline-stage/config.ini"),
-    ("nt", {"APPDATA": "/tmp/appdata"}, "/tmp/appdata/aw-watcher-pipeline-stage/config.ini"),
-    ("nt", {}, ".config/aw-watcher-pipeline-stage/config.ini"),
+    ("posix", {"XDG_CONFIG_HOME": "/tmp/xdg"}, "/tmp/xdg/aw-watcher-pipeline-stage/"),
+    ("posix", {}, ".config/aw-watcher-pipeline-stage/"),
+    ("nt", {"APPDATA": "/tmp/appdata"}, "/tmp/appdata/aw-watcher-pipeline-stage/"),
+    ("nt", {}, ".config/aw-watcher-pipeline-stage/"),
 ])
 def test_config_file_location_logic(
     os_name: str, 
     env_vars: dict, 
-    expected_path_part: str,
+    expected_path_prefix: str,
 ) -> None:
     """Test logic for determining config file location across platforms."""
     with patch("os.name", os_name):
         with patch.dict(os.environ, env_vars, clear=True):
             with patch("os.path.isfile", return_value=False) as mock_isfile:
                 with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", "/home/user")):
-                    load_config({})
-                    
-                    checked_paths = [str(args[0]).replace("\\", "/") for args, _ in mock_isfile.call_args_list]
-                    assert any(expected_path_part in p for p in checked_paths)
+                    # We need to ensure that the paths are generated correctly
+                    from aw_watcher_pipeline_stage.config import _get_config_file_paths
+                    paths = _get_config_file_paths()
+
+                    assert f"{expected_path_prefix}config.toml" in paths
+                    assert f"{expected_path_prefix}config.ini" in paths
 
 
 def test_watch_path_as_path_object() -> None:
@@ -698,18 +716,23 @@ def test_watch_path_as_path_object() -> None:
     assert isinstance(config.watch_path, str)
 
 
-def test_relative_path_preservation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test that relative paths are preserved in config (not resolved to absolute)."""
+def test_relative_path_is_resolved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that relative paths are resolved to absolute paths, not preserved as-is."""
     monkeypatch.chdir(tmp_path)
+    # Create dummy dirs so validation can find a parent
+    (tmp_path / "relative").mkdir()
+
     # CLI
     config = load_config({"watch_path": "./relative/foo"})
-    assert config.watch_path == "./relative/foo"
+    assert config.watch_path != "./relative/foo"
+    assert Path(config.watch_path).is_absolute()
     
     # Config file
-    (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nwatch_path = ../parent/bar", encoding="utf-8")
+    (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nwatch_path = ./relative/bar", encoding="utf-8")
     with patch.dict(os.environ, {}, clear=True):
         config = load_config({})
-        assert config.watch_path == "../parent/bar"
+        assert config.watch_path != "./relative/bar"
+        assert Path(config.watch_path).is_absolute()
 
 
 def test_user_expansion_extended() -> None:
@@ -732,7 +755,7 @@ def test_git_root_detection_from_file_path(tmp_path: Path) -> None:
         with patch.dict(os.environ, {}, clear=True):
             config = load_config({})
             # Should resolve to tmp_path (the git root)
-            assert Path(config.watch_path).resolve() == tmp_path.resolve()
+            assert Path(config.watch_path).resolve() == (tmp_path / "current_task.json").resolve()
 
 
 def test_config_path_construction_uses_os_path_join() -> None:
@@ -770,6 +793,68 @@ def test_debounce_seconds_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     with patch.dict(os.environ, {"AW_WATCHER_DEBOUNCE_SECONDS": "0.5"}, clear=True):
         config = load_config({"debounce_seconds": 3.0})
         assert config.debounce_seconds == 3.0
+
+
+def test_tomli_missing_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that a warning is logged if config.toml exists but tomli is missing."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text("", encoding="utf-8")
+
+    with patch("aw_watcher_pipeline_stage.config.tomli", None):
+        with patch("aw_watcher_pipeline_stage.config.logger") as mock_logger:
+            with patch.dict(os.environ, {}, clear=True):
+                load_config({})
+                mock_logger.warning.assert_called()
+                assert "tomli is not installed" in str(mock_logger.warning.call_args)
+
+
+def test_full_config_flow_matrix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Verify config flow: CLI > Env > Config File > Defaults.
+    Tests a matrix of overlapping configurations to ensure strict priority.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    # 1. Setup Config File (Lowest priority source)
+    (tmp_path / "config.ini").write_text("""
+[aw-watcher-pipeline-stage]
+port = 5001
+pulsetime = 10.0
+debounce_seconds = 1.0
+""", encoding="utf-8")
+
+    # 2. Setup Env (Middle priority)
+    env = {
+        "AW_WATCHER_PORT": "5002",
+        "AW_WATCHER_PULSETIME": "20.0"
+        # debounce_seconds NOT set in Env
+    }
+
+    # 3. Setup CLI (Highest priority)
+    cli_args = {
+        "port": 5003
+        # pulsetime NOT set in CLI
+        # debounce_seconds NOT set in CLI
+    }
+
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config(cli_args)
+
+        # Port: CLI (5003) > Env (5002) > Config (5001)
+        assert config.port == 5003
+
+        # Pulsetime: CLI (None) -> Env (20.0) > Config (10.0)
+        assert config.pulsetime == 20.0
+
+        # Debounce: CLI (None) -> Env (None) -> Config (1.0) > Default (1.0)
+        assert config.debounce_seconds == 1.0
+
+
+def test_metadata_allowlist_non_string_elements() -> None:
+    """Test that non-string elements in metadata_allowlist are converted/handled."""
+    # Simulate list from TOML containing ints
+    config = load_config({"metadata_allowlist": ["tag1", 123, "tag2"]})
+    assert config.metadata_allowlist == ["tag1", "123", "tag2"]
 
 def test_log_file_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test priority for log_file."""
@@ -921,11 +1006,13 @@ def test_find_project_root_oserror(tmp_path: Path) -> None:
 
 
 def test_windows_env_var_path() -> None:
-    """Test that Windows paths in environment variables are preserved."""
+    """Test that Windows paths in environment variables are handled."""
     win_path = r"D:\Projects\MyPipeline"
-    with patch.dict(os.environ, {"PIPELINE_WATCHER_PATH": win_path}, clear=True):
-        config = load_config({})
-        assert config.watch_path == win_path
+    with patch("aw_watcher_pipeline_stage.config._validate_path") as mock_validate:
+        mock_validate.return_value = win_path
+        with patch.dict(os.environ, {"PIPELINE_WATCHER_PATH": win_path}, clear=True):
+            config = load_config({})
+            assert config.watch_path == win_path
 
 
 def test_fallback_config_path_construction() -> None:
@@ -1001,9 +1088,10 @@ def test_cwd_failure_handling() -> None:
     """Test that config loading survives if Path.cwd() fails."""
     with patch("pathlib.Path.cwd", side_effect=OSError("Current directory not found")):
         with patch("aw_watcher_pipeline_stage.config._find_project_root") as mock_find:
-            config = load_config({})
-            assert config.watch_path == "."
-            mock_find.assert_not_called()
+            with patch("aw_watcher_pipeline_stage.config._validate_path", return_value="."):
+                config = load_config({})
+                assert config.watch_path == "."
+                mock_find.assert_not_called()
 
 
 def test_cli_extra_keys_ignored() -> None:
@@ -1091,8 +1179,8 @@ def test_find_project_root_logic(tmp_path: Path) -> None:
     no_git_dir = tmp_path / "nogit"
     no_git_dir.mkdir()
     
-    # Mock .exists() to always return False to simulate no .git anywhere up the tree
-    with patch("pathlib.Path.exists", return_value=False):
+    # Mock iterdir to return empty list to simulate no .git anywhere up the tree
+    with patch("pathlib.Path.iterdir", return_value=[]):
         assert _find_project_root(no_git_dir) is None
 
 
@@ -1214,11 +1302,14 @@ def test_log_level_normalization() -> None:
 
 
 def test_path_resolution_mixed_separators() -> None:
-    """Test handling of mixed path separators."""
-    # On Windows, python handles / and \ interchangeably in many cases, but we want to ensure they are preserved.
+    """Test that paths with mixed separators are passed to the validator."""
     mixed_path = "C:/Users\\Dev/project"
-    config = load_config({"watch_path": mixed_path})
-    assert config.watch_path == mixed_path
+    with patch("aw_watcher_pipeline_stage.config._validate_path") as mock_validate:
+        resolved_path = mixed_path.replace("\\", "/").replace("/", os.sep)
+        mock_validate.return_value = resolved_path
+        config = load_config({"watch_path": mixed_path})
+        mock_validate.assert_called_with(mixed_path, is_log=False)
+        assert config.watch_path == resolved_path
 
 
 def test_config_file_empty_values_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1241,7 +1332,7 @@ def test_config_file_empty_watch_path_ignored(tmp_path: Path, monkeypatch: pytes
     with patch("aw_watcher_pipeline_stage.config._find_project_root", return_value=None):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config({})
-            assert config.watch_path == "."
+            assert Path(config.watch_path) == (tmp_path / "current_task.json").resolve()
 
 
 def test_windows_config_file_expansion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1440,7 +1531,7 @@ def test_cli_empty_string_resets_to_default(tmp_path: Path, monkeypatch: pytest.
         with patch.dict(os.environ, {}, clear=True):
             config = load_config(cli_args)
             # Should default to "." because CLI "" overrides config, and "" triggers default logic
-            assert config.watch_path == "."
+            assert Path(config.watch_path) == (tmp_path / "current_task.json").resolve()
 
 
 def test_xdg_config_home_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1492,7 +1583,7 @@ def test_path_traversal_resolution(tmp_path: Path) -> None:
 
 
 def test_symlink_config_resolution(tmp_path: Path) -> None:
-    """Test that config loading resolves symlinks to their targets."""
+    """Test that config loading rejects symlinks."""
     target = tmp_path / "real.json"
     target.touch()
     link = tmp_path / "link.json"
@@ -2490,6 +2581,18 @@ def test_validate_path_relative_symlink_resolution(tmp_path: Path, monkeypatch: 
         load_config({"watch_path": str(link)})
 
 
+def test_find_project_root_no_git(tmp_path: Path) -> None:
+    """Test _find_project_root with no .git directory."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+
+    # Use a directory without a .git subdirectory
+    no_git_dir = tmp_path / "nogit"
+    no_git_dir.mkdir()
+
+    # Should return None
+    root = _find_project_root(no_git_dir)
+    assert root is None
+
 @pytest.mark.parametrize("method_name, exception", [
     ("pathlib.Path.resolve", PermissionError("Access denied")),
     ("pathlib.Path.exists", PermissionError("Access denied")),
@@ -2725,3 +2828,550 @@ def test_metadata_allowlist_mixed_source_parsing(tmp_path: Path) -> None:
     with patch.dict(os.environ, env, clear=True):
         config = load_config({})
         assert config.metadata_allowlist == ["env1", "env2"]
+
+
+def test_env_type_conversion_robustness() -> None:
+    """Test that environment variables (strings) are correctly converted to target types."""
+    env = {
+        "AW_WATCHER_PORT": "1234",
+        "AW_WATCHER_PULSETIME": "15.5",
+        "AW_WATCHER_DEBOUNCE_SECONDS": "0.1",
+        "AW_WATCHER_BATCH_SIZE_LIMIT": "20",
+        "AW_WATCHER_TESTING": "true",
+        "AW_WATCHER_METADATA_ALLOWLIST": "a, b, c",
+        "AW_WATCHER_LOG_LEVEL": "debug"
+    }
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config({})
+        
+        assert config.port == 1234
+        assert isinstance(config.port, int)
+        
+        assert config.pulsetime == 15.5
+        assert isinstance(config.pulsetime, float)
+        
+        assert config.debounce_seconds == 0.1
+        assert isinstance(config.debounce_seconds, float)
+        
+        assert config.batch_size_limit == 20
+        assert isinstance(config.batch_size_limit, int)
+        
+        assert config.testing is True
+        assert isinstance(config.testing, bool)
+        
+        assert config.metadata_allowlist == ["a", "b", "c"]
+        assert isinstance(config.metadata_allowlist, list)
+        
+        assert config.log_level == "DEBUG"
+
+
+def test_env_invalid_types_raise() -> None:
+    """Test that invalid environment variable values raise ValueError."""
+    with patch.dict(os.environ, {"AW_WATCHER_PORT": "invalid"}, clear=True):
+        with pytest.raises(ValueError, match="Invalid integer for port"):
+            load_config({})
+            
+    with patch.dict(os.environ, {"AW_WATCHER_PULSETIME": "invalid"}, clear=True):
+        with pytest.raises(ValueError, match="Invalid float for pulsetime"):
+            load_config({})
+            
+    with patch.dict(os.environ, {"AW_WATCHER_BATCH_SIZE_LIMIT": "invalid"}, clear=True):
+        with pytest.raises(ValueError, match="Invalid integer for batch_size_limit"):
+            load_config({})
+
+
+def test_metadata_allowlist_complex_env() -> None:
+    """Test metadata allowlist parsing from Env with messy spacing and empty items."""
+    # " a , , b " -> ["a", "b"]
+    with patch.dict(os.environ, {"AW_WATCHER_METADATA_ALLOWLIST": " a , , b "}, clear=True):
+        config = load_config({})
+        assert config.metadata_allowlist == ["a", "b"]
+
+
+def test_metadata_allowlist_empty_env_hack() -> None:
+    """Test that a comma-only string in Env results in empty list (allow nothing)."""
+    # "," -> []
+    with patch.dict(os.environ, {"AW_WATCHER_METADATA_ALLOWLIST": ","}, clear=True):
+        config = load_config({})
+        assert config.metadata_allowlist == []
+
+
+def test_toml_config_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test loading configuration from a TOML file."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text('[aw-watcher-pipeline-stage]\nport = 5678\ntesting = true', encoding="utf-8")
+    
+    # Mock tomli to avoid dependency requirement in test environment if missing
+    mock_tomli = MagicMock()
+    mock_tomli.load.return_value = {"aw-watcher-pipeline-stage": {"port": 5678, "testing": True}}
+    
+    with patch("aw_watcher_pipeline_stage.config.tomli", mock_tomli):
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config({})
+            assert config.port == 5678
+            assert config.testing is True
+
+
+def test_toml_priority_over_ini(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that config.toml takes precedence over config.ini in the same directory."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text('[aw-watcher-pipeline-stage]\nport = 6000', encoding="utf-8")
+    (tmp_path / "config.ini").write_text('[aw-watcher-pipeline-stage]\nport = 5000', encoding="utf-8")
+    
+    mock_tomli = MagicMock()
+    mock_tomli.load.return_value = {"aw-watcher-pipeline-stage": {"port": 6000}}
+    
+    with patch("aw_watcher_pipeline_stage.config.tomli", mock_tomli):
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config({})
+            # Should match TOML value
+            assert config.port == 6000
+
+
+def test_config_file_hyphenated_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that hyphenated keys in config file are normalized to underscores."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.ini").write_text("[aw-watcher-pipeline-stage]\nwatch-path = ./hyphenated\ndebounce-seconds = 0.5", encoding="utf-8")
+    
+    with patch.dict(os.environ, {}, clear=True):
+        config = load_config({})
+        # _validate_path resolves the path, so we check if it ends with "hyphenated"
+        assert config.watch_path.endswith("hyphenated")
+        assert config.debounce_seconds == 0.5
+
+
+def test_priority_cli_overrides_env_and_config_all_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Verify that CLI arguments override both Environment variables and Config file values
+    for EVERY configuration field.
+    """
+    monkeypatch.chdir(tmp_path)
+    
+    # 1. Config File (Lowest)
+    (tmp_path / "config.ini").write_text("""
+[aw-watcher-pipeline-stage]
+watch_path = ./file.json
+port = 1001
+testing = false
+log_file = file.log
+log_level = INFO
+pulsetime = 10.0
+debounce_seconds = 1.0
+metadata_allowlist = file1, file2
+batch_size_limit = 1
+""", encoding="utf-8")
+
+    # 2. Env (Middle)
+    env = {
+        "PIPELINE_WATCHER_PATH": "./env.json",
+        "AW_WATCHER_PORT": "2002",
+        "AW_WATCHER_TESTING": "false", # Config is false, Env is false
+        "AW_WATCHER_LOG_FILE": "env.log",
+        "AW_WATCHER_LOG_LEVEL": "WARNING",
+        "AW_WATCHER_PULSETIME": "20.0",
+        "AW_WATCHER_DEBOUNCE_SECONDS": "2.0",
+        "AW_WATCHER_METADATA_ALLOWLIST": "env1, env2",
+        "AW_WATCHER_BATCH_SIZE_LIMIT": "2"
+    }
+
+    # 3. CLI (Highest)
+    cli_args = {
+        "watch_path": "./cli.json",
+        "port": 3003,
+        "testing": True,
+        "log_file": "cli.log",
+        "log_level": "DEBUG",
+        "pulsetime": 30.0,
+        "debounce_seconds": 3.0,
+        "metadata_allowlist": "cli1, cli2",
+        "batch_size_limit": 3
+    }
+
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config(cli_args)
+
+        assert config.watch_path == "./cli.json"
+        assert config.port == 3003
+        assert config.testing is True
+        assert config.log_file == "cli.log"
+        assert config.log_level == "DEBUG"
+        assert config.pulsetime == 30.0
+        assert config.debounce_seconds == 3.0
+        assert config.metadata_allowlist == ["cli1", "cli2"]
+        assert config.batch_size_limit == 3
+
+
+def test_priority_env_overrides_config_all_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Verify that Environment variables override Config file values for EVERY configuration field.
+    """
+    monkeypatch.chdir(tmp_path)
+    
+    # 1. Config File (Lowest)
+    (tmp_path / "config.ini").write_text("""
+[aw-watcher-pipeline-stage]
+watch_path = ./file.json
+port = 1001
+testing = false
+log_file = file.log
+log_level = INFO
+pulsetime = 10.0
+debounce_seconds = 1.0
+metadata_allowlist = file1, file2
+batch_size_limit = 1
+""", encoding="utf-8")
+
+    # 2. Env (Highest in this test)
+    env = {
+        "PIPELINE_WATCHER_PATH": "./env.json",
+        "AW_WATCHER_PORT": "2002",
+        "AW_WATCHER_TESTING": "true",
+        "AW_WATCHER_LOG_FILE": "env.log",
+        "AW_WATCHER_LOG_LEVEL": "WARNING",
+        "AW_WATCHER_PULSETIME": "20.0",
+        "AW_WATCHER_DEBOUNCE_SECONDS": "2.0",
+        "AW_WATCHER_METADATA_ALLOWLIST": "env1, env2",
+        "AW_WATCHER_BATCH_SIZE_LIMIT": "2"
+    }
+
+    with patch.dict(os.environ, env, clear=True):
+        config = load_config({})
+
+        assert config.watch_path == "./env.json"
+        assert config.port == 2002
+        assert config.testing is True
+        assert config.log_file == "env.log"
+        assert config.log_level == "WARNING"
+        assert config.pulsetime == 20.0
+        assert config.debounce_seconds == 2.0
+        assert config.metadata_allowlist == ["env1", "env2"]
+        assert config.batch_size_limit == 2
+
+
+def test_metadata_allowlist_invalid_type() -> None:
+    """Test that invalid type for metadata_allowlist raises ValueError."""
+    with pytest.raises(ValueError, match="Invalid type for metadata_allowlist"):
+        load_config({"metadata_allowlist": 123})
+
+
+def test_find_project_root_robustness_iterdir(tmp_path: Path) -> None:
+    """Test that _find_project_root handles iterdir errors gracefully."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+
+    # Create a dir, but mock iterdir to fail with OSError
+    test_dir = tmp_path / "test_dir"
+    test_dir.mkdir()
+
+    # Simulate iterdir raising OSError (e.g. permission denied)
+    with patch("pathlib.Path.iterdir", side_effect=OSError("iterdir failed")):
+        # find_project_root should catch OSError and return None
+        root = _find_project_root(test_dir)
+        assert root is None
+
+@pytest.mark.parametrize("test_path", [
+    "valid_file.json", # Relative Path
+    "/absolute/valid/path.json", # Absolute Path
+    "~/valid/user/path.json",  # User expanded Path
+])
+def test_various_path_validation(test_path: str) -> None:
+    """Confirm that _validate_path calls Path.resolve(strict=True)."""
+    with patch("aw_watcher_pipeline_stage.config.Path") as mock_path_cls:
+        mock_path_instance = mock_path_cls.return_value
+        mock_path_instance.resolve.return_value = mock_path_instance
+        mock_path_instance.exists.return_value = True
+        mock_path_instance.is_file.return_value = True
+        mock_path_instance.__str__.return_value = test_path
+
+        with patch("aw_watcher_pipeline_stage.config.os.path.expanduser", return_value=test_path):
+            from aw_watcher_pipeline_stage.config import _validate_path
+            _validate_path(test_path)
+            mock_path_instance.resolve.assert_called_with(strict=True)
+
+
+def test_git_root_detection_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test git root detection when .git is a file (worktree/submodule)."""
+    (tmp_path / ".git").touch()
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+
+    monkeypatch.chdir(subdir)
+
+    # Ensure no config/env interference
+    with patch.dict(os.environ, {}, clear=True):
+        config = load_config({})
+        # Should resolve to tmp_path (the git root)
+        assert Path(config.watch_path).resolve() == (tmp_path / "current_task.json").resolve()
+
+
+def test_validate_path_traversal_resolution_explicit(tmp_path: Path) -> None:
+    """Test that '..' in path is resolved and does not remain in the final path."""
+    target = tmp_path / "target.json"
+    target.touch()
+
+    # Path with ..
+    path_with_dots = tmp_path / "subdir" / ".." / "target.json"
+    (tmp_path / "subdir").mkdir()
+
+    config = load_config({"watch_path": str(path_with_dots)})
+
+    # The stored path should be absolute and NOT contain ..
+    assert ".." not in config.watch_path
+    assert config.watch_path == str(target.resolve())
+
+
+def test_find_project_root_permission_error(tmp_path: Path) -> None:
+    """Test that _find_project_root handles PermissionError during iterdir."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+
+    (tmp_path / ".git").mkdir()
+
+    with patch("pathlib.Path.iterdir", side_effect=PermissionError("Access denied")):
+        assert _find_project_root(tmp_path) is None
+
+
+def test_validate_path_returns_absolute(tmp_path: Path) -> None:
+    """Test that _validate_path returns an absolute path string."""
+    from aw_watcher_pipeline_stage.config import _validate_path
+
+    f = tmp_path / "test.json"
+    f.touch()
+
+    res = _validate_path(str(f))
+    assert Path(res).is_absolute()
+    assert res == str(f.resolve())
+
+def test_validate_path_absolute_traversal_resolution(tmp_path: Path) -> None:
+    """Test that absolute path with '..' is resolved."""
+    target = tmp_path / "target.json"
+    target.touch()
+    
+    # /tmp/subdir/../target.json
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    abs_path_with_dots = str(subdir / ".." / "target.json")
+    
+    config = load_config({"watch_path": abs_path_with_dots})
+    
+    assert config.watch_path == str(target.resolve())
+    assert ".." not in config.watch_path
+
+def test_find_project_root_start_path_is_file(tmp_path: Path) -> None:
+    """Test _find_project_root when start_path is a file."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+    
+    (tmp_path / ".git").mkdir()
+    f = tmp_path / "file.txt"
+    f.touch()
+    
+    assert _find_project_root(f) == tmp_path.resolve()
+
+def test_find_project_root_start_path_not_exists(tmp_path: Path) -> None:
+    """Test _find_project_root when start_path does not exist."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+    
+    assert _find_project_root(tmp_path / "nonexistent") is None
+
+def test_find_project_root_at_root() -> None:
+    """Test _find_project_root when start_path is the filesystem root."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+    
+    # Mock resolve to return a root-like path that has no parents
+    with patch("pathlib.Path.resolve") as mock_resolve:
+        root_mock = MagicMock(spec=Path)
+        root_mock.is_file.return_value = False
+        root_mock.parents = [] # Root has no parents
+        root_mock.iterdir.return_value = [] # No .git
+        mock_resolve.return_value = root_mock
+        
+        assert _find_project_root(Path("/any")) is None
+
+def test_validate_path_cwd_filename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test validation of a simple filename in CWD."""
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "current_task.json"
+    f.touch()
+    
+    from aw_watcher_pipeline_stage.config import _validate_path
+    resolved = _validate_path("current_task.json")
+    assert resolved == str(f.resolve())
+
+def test_validate_path_traversal_parent_escape(tmp_path: Path) -> None:
+    """Test that traversal using .. is resolved and checked."""
+    # Structure: /tmp/base/target.json
+    base = tmp_path / "base"
+    base.mkdir()
+    target = base / "target.json"
+    target.touch()
+
+    # Path: /tmp/base/subdir/../target.json
+    # This resolves to /tmp/base/target.json
+    subdir = base / "subdir"
+    subdir.mkdir()
+    traversal_path = str(subdir / ".." / "target.json")
+
+    config = load_config({"watch_path": traversal_path})
+    assert config.watch_path == str(target.resolve())
+
+def test_validate_path_non_existent_no_suffix(tmp_path: Path) -> None:
+    """Test validation of a non-existent path without suffix (treated as file)."""
+    # /tmp/missing_file
+    missing = tmp_path / "missing_file"
+    
+    config = load_config({"watch_path": str(missing)})
+    
+    # Should be accepted because parent (tmp_path) exists
+    assert config.watch_path == str(missing.resolve())
+    
+    # Ensure it wasn't treated as a directory (no current_task.json appended)
+    assert not config.watch_path.endswith("current_task.json")
+
+
+def test_find_project_root_skips_permission_error(tmp_path: Path) -> None:
+    """Test that _find_project_root continues to parent if child raises PermissionError."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+    
+    # /tmp/repo/.git
+    # /tmp/repo/subdir
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    subdir = repo / "subdir"
+    subdir.mkdir()
+    
+    def iterdir_side_effect(self):
+        # Use resolve to ensure path equality works
+        if self.resolve() == subdir.resolve():
+            raise PermissionError("Access denied")
+        if self.resolve() == repo.resolve():
+            # Return a dummy object with .name == ".git"
+            mock_child = MagicMock()
+            mock_child.name = ".git"
+            return [mock_child]
+        return []
+
+    with patch("pathlib.Path.iterdir", side_effect=iterdir_side_effect, autospec=True):
+        root = _find_project_root(subdir)
+        assert root == repo.resolve()
+
+
+def test_validate_path_traversal_creation(tmp_path: Path) -> None:
+    """Test validation of a path with traversal where the target doesn't exist (creation)."""
+    from aw_watcher_pipeline_stage.config import _validate_path
+    
+    # /tmp/base
+    base = tmp_path / "base"
+    base.mkdir()
+    
+    # Path: /tmp/base/../new_file.json -> /tmp/new_file.json
+    # /tmp exists.
+    
+    path_str = str(base / ".." / "new_file.json")
+    
+    resolved = _validate_path(path_str)
+    expected = tmp_path / "new_file.json"
+    
+    assert resolved == str(expected.resolve())
+
+
+def test_find_project_root_uses_iterdir(tmp_path: Path) -> None:
+    """Verify that _find_project_root uses iterdir to find .git (as required by spec)."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+    
+    (tmp_path / ".git").mkdir()
+    
+    # Spy on Path.iterdir to ensure it's called
+    with patch("pathlib.Path.iterdir", wraps=Path.iterdir) as mock_iterdir:
+        root = _find_project_root(tmp_path)
+        assert root == tmp_path
+        assert mock_iterdir.called
+
+
+def test_validate_path_cwd_parent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test validation of '..' as watch path (watching parent dir)."""
+    monkeypatch.chdir(tmp_path)
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+    
+    # '..' refers to tmp_path
+    # Should resolve to tmp_path/current_task.json (default file appended for dir)
+    
+    config = load_config({"watch_path": ".."})
+    
+    expected = tmp_path / "current_task.json"
+    assert config.watch_path == str(expected.resolve())
+
+
+def test_find_project_root_recursion_error(tmp_path: Path) -> None:
+    """Test that _find_project_root handles RecursionError (symlink loop)."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+    
+    with patch("pathlib.Path.resolve", side_effect=RuntimeError("Symlink loop")):
+        assert _find_project_root(tmp_path) is None
+
+
+def test_validate_path_relative_traversal_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test validation of '../target.json' relative to CWD resolves correctly."""
+    # Create a subdir to be CWD
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+    
+    target = tmp_path / "target.json"
+    target.touch()
+    
+    # Path relative to subdir: ../target.json -> tmp_path/target.json
+    config = load_config({"watch_path": "../target.json"})
+    assert config.watch_path == str(target.resolve())
+
+
+def test_config_watch_path_is_absolute_string(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that the Config object stores watch_path as an absolute string."""
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "test.json"
+    f.touch()
+    
+    # Pass relative path
+    config = load_config({"watch_path": "test.json"})
+    
+    assert isinstance(config.watch_path, str)
+    assert Path(config.watch_path).is_absolute()
+    assert config.watch_path == str(f.resolve())
+
+
+def test_validate_path_redundant_separators(tmp_path: Path) -> None:
+    """Test that redundant separators are handled."""
+    f = tmp_path / "test.json"
+    f.touch()
+    
+    from aw_watcher_pipeline_stage.config import _validate_path
+    # Construct path with //
+    path_str = str(tmp_path) + "//test.json"
+    
+    resolved = _validate_path(path_str)
+    assert resolved == str(f.resolve())
+
+
+def test_validate_path_current_directory_component(tmp_path: Path) -> None:
+    """Test that . component is handled."""
+    f = tmp_path / "test.json"
+    f.touch()
+    
+    from aw_watcher_pipeline_stage.config import _validate_path
+    # Construct path with /./
+    path_str = str(tmp_path) + "/./test.json"
+    
+    resolved = _validate_path(path_str)
+    assert resolved == str(f.resolve())
+
+
+def test_find_project_root_inside_git_dir(tmp_path: Path) -> None:
+    """Test finding project root when CWD is inside .git directory."""
+    from aw_watcher_pipeline_stage.config import _find_project_root
+    
+    (tmp_path / ".git").mkdir()
+    git_internal = tmp_path / ".git" / "objects"
+    git_internal.mkdir(parents=True)
+    
+    # Should find tmp_path because it contains .git
+    assert _find_project_root(git_internal) == tmp_path.resolve()

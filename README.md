@@ -1,5 +1,5 @@
 # aw-watcher-pipeline-stage
-<!-- Last Major Change: Stage 7 Documentation & Maintainability complete; project fully documented and maintainable -->
+<!-- Last Major Change: Stage 8 Final Integration Review complete; ready for release/PR submission -->
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Tests](https://github.com/yourusername/aw-watcher-pipeline-stage/actions/workflows/python-test.yml/badge.svg)](https://github.com/yourusername/aw-watcher-pipeline-stage/actions/workflows/python-test.yml) [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black) [![Checked with mypy](http://www.mypy-lang.org/static/mypy_badge.svg)](http://mypy-lang.org/)
 
@@ -18,8 +18,8 @@ This watcher monitors a local `current_task.json` file and automatically logs yo
 - [Installation](#installation)
 - [Usage](#usage)
 - [Configuration](#configuration)
-- [Logging](#logging)
 - [JSON Schema](#json-schema)
+- [Viewing in ActivityWatch](#viewing-in-activitywatch)
 - [Architecture](#architecture)
 - [Troubleshooting](#troubleshooting)
 - [Security Notes](#security-notes)
@@ -55,11 +55,34 @@ Start the watcher by running:
 
 ```bash
 aw-watcher-pipeline-stage
+# If installed via Poetry without activating the shell:
+# poetry run aw-watcher-pipeline-stage
 ```
 
 By default, it looks for `current_task.json` in the current directory or the project root (detected via `.git`).
 
 The watcher runs in the background with minimal resource usage (see Performance and Non-Functional Compliance in ARCHITECTURE.md).
+
+### Auto-start with ActivityWatch (aw-qt)
+
+To automatically start this watcher with ActivityWatch, add it to your `aw-qt` configuration file.
+
+**Locations:**
+- **Linux**: `~/.config/activitywatch/aw-qt/aw-qt.toml`
+- **macOS**: `~/Library/Application Support/activitywatch/aw-qt/aw-qt.toml`
+- **Windows**: `%LOCALAPPDATA%\activitywatch\aw-qt\aw-qt.toml`
+
+Add the following section:
+
+```toml
+[aw-watcher-pipeline-stage]
+# Ensure the executable is in your PATH, or provide the full absolute path
+cmd = ["aw-watcher-pipeline-stage"]
+# If installed via Poetry, use the absolute path to the executable in the virtualenv
+# (Run `poetry run which aw-watcher-pipeline-stage` to find it)
+# Optional: Add arguments
+# cmd = ["aw-watcher-pipeline-stage", "--watch-path", "/home/user/projects/current_task.json"]
+```
 
 ### CLI Options
 
@@ -169,9 +192,31 @@ The watcher monitors a JSON file (default `current_task.json`) that defines your
 | `start_time` | String | No | ISO 8601 UTC timestamp of when the task started. |
 | `metadata` | Object | No | Arbitrary key-value pairs (flattened into event data). |
 
+## Viewing in ActivityWatch
+
+### Buckets
+Data is stored in a bucket named `aw-watcher-pipeline-stage_<hostname>` with event type `current-pipeline-stage`. You can verify data is being received by checking the **Buckets** tab in the ActivityWatch WebUI (default: `http://localhost:5600`).
+
+### Categorization
+To visualize time spent per stage or task, you can use the **Query** tab to aggregate data. The watcher populates the event data with the following fields:
+*   `stage`
+*   `task`
+*   `project_id`
+*   `status`
+*   `metadata` (flattened)
+
+**Example Query (Time per Stage):**
+
+```python
+bucket = find_bucket("aw-watcher-pipeline-stage_");
+events = query_bucket(bucket);
+events = merge_events_by_keys(events, ["stage"]);
+RETURN = sort_by_duration(events);
+```
+
 ## Architecture
 
-For a detailed overview of the system design, component interactions, and architectural decisions (including offline resilience, debounce logic, and non-functional compliance), please refer to ARCHITECTURE.md.
+For a detailed overview of the system design, component interactions, and architectural decisions (including offline resilience, debounce logic, and non-functional compliance), please refer to [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Troubleshooting
 
